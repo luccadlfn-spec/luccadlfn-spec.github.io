@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no, viewport-fit=cover">
+<meta name="disabled-adaptations" content="watch">
+<meta name="format-detection" content="telephone=no">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https:; base-uri 'none'; form-action 'none'">
+<title>Codex Remote</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html { font-size: 16px; }
+  body { background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; padding: 8px 8px 24px; }
+  h1 { font-size: 1.15rem; text-align: center; padding: 6px 0 10px; color: #7ee787; }
+  h2 { font-size: 1.05rem; padding: 2px 0 8px; color: #9ecbff; }
+  .view { display: none; }
+  .view.active { display: block; }
+  .btn { display: block; width: 100%; min-height: 52px; font-size: 1.1rem; font-weight: 600; color: #fff;
+         background: #1f6feb; border: 0; border-radius: 14px; margin: 8px 0; padding: 12px; }
+  .btn:disabled { opacity: 0.45; }
+  .btn.gray { background: #30363d; }
+  .btn.green { background: #238636; }
+  .btn.red { background: #b62324; }
+  .btn.small { min-height: 42px; font-size: 0.95rem; padding: 8px; }
+  textarea, input { width: 100%; font-size: 1.1rem; color: #fff; background: #161b22; border: 1px solid #30363d;
+                    border-radius: 12px; padding: 12px; margin: 6px 0; }
+  textarea { min-height: 84px; }
+  input.pin { font-size: 1.5rem; letter-spacing: 0.4em; text-align: center; }
+  label { font-size: 0.9rem; color: #8b949e; display: block; margin-top: 8px; }
+  .out { white-space: pre-wrap; word-break: break-word; font-size: 1.05rem; line-height: 1.45;
+         background: #0d1117; border: 1px solid #30363d; border-radius: 12px; padding: 12px; margin: 8px 0; min-height: 40px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 12px; margin: 8px 0; }
+  .card .meta { font-size: 0.85rem; color: #8b949e; margin-top: 4px; }
+  .badge { display: inline-block; font-size: 0.8rem; font-weight: 700; border-radius: 8px; padding: 2px 8px; background: #30363d; }
+  .badge.on { background: #238636; }
+  .badge.off { background: #b62324; }
+  .badge.warn { background: #9e6a03; }
+  #toast { position: fixed; left: 8px; right: 8px; bottom: 8px; background: #b62324; color: #fff; font-size: 0.95rem;
+           border-radius: 12px; padding: 10px 12px; display: none; z-index: 9; text-align: center; }
+  .note { font-size: 0.85rem; color: #8b949e; line-height: 1.4; margin: 6px 0; }
+</style>
+</head>
+<body>
+<h1>Codex Remote</h1>
+
+<div class="view" id="v-setup">
+  <h2>Setup</h2>
+  <p class="note">No access token found. Reopen this page from the link in your Mail message — keep that email. The field below is a desktop fallback only.</p>
+  <input id="setup-token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Watch token">
+  <button class="btn" onclick="saveToken()">Save token</button>
+</div>
+
+<div class="view" id="v-home">
+  <button class="btn gray" onclick="openStatus()">Connection Status</button>
+  <button class="btn" onclick="show('v-chat')">Ask AI</button>
+  <button class="btn" onclick="openTasks()">Task Status</button>
+  <button class="btn" onclick="openApprovals()">Pending Approvals</button>
+  <button class="btn green" onclick="show('v-newtask')">New Codex Task</button>
+</div>
+
+<div class="view" id="v-status">
+  <h2>Connection</h2>
+  <div class="out" id="status-out">Checking…</div>
+  <button class="btn small gray" onclick="openStatus()">Refresh</button>
+  <button class="btn small gray" onclick="show('v-home')">Back</button>
+</div>
+
+<div class="view" id="v-chat">
+  <h2>Ask AI</h2>
+  <textarea id="chat-text" placeholder="Question…"></textarea>
+  <button class="btn" id="chat-send" onclick="sendChat()">Send</button>
+  <button class="btn small gray" id="chat-check" onclick="checkChat()">Check answer</button>
+  <div class="out" id="chat-out">Answers appear here.</div>
+  <button class="btn small gray" onclick="show('v-home')">Back</button>
+</div>
+
+<div class="view" id="v-tasks">
+  <h2>Tasks</h2>
+  <div id="tasks-list" class="note">Loading…</div>
+  <button class="btn small gray" onclick="openTasks()">Refresh</button>
+  <button class="btn small gray" onclick="show('v-home')">Back</button>
+</div>
+
+<div class="view" id="v-task">
+  <h2>Task</h2>
+  <div class="out" id="task-detail"></div>
+  <label>PIN to cancel this task</label>
+  <input id="cancel-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
+  <button class="btn red" id="cancel-send" onclick="cancelTask()">Cancel Task</button>
+  <button class="btn small gray" onclick="openTasks()">Back to tasks</button>
+</div>
+
+<div class="view" id="v-newtask">
+  <h2>New Codex Task</h2>
+  <textarea id="task-text" placeholder="Instruction for the PC workspace…"></textarea>
+  <label>Six-digit PIN</label>
+  <input id="task-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
+  <button class="btn green" id="task-send" onclick="startTask()">Start Task</button>
+  <div class="out" id="task-out">Task result status appears here.</div>
+  <button class="btn small gray" onclick="show('v-home')">Back</button>
+</div>
+
+<div class="view" id="v-approvals">
+  <h2>Approvals</h2>
+  <div id="approvals-list" class="note">Loading…</div>
+  <button class="btn small gray" onclick="openApprovals()">Refresh</button>
+  <button class="btn small gray" onclick="show('v-home')">Back</button>
+</div>
+
+<div class="view" id="v-approval">
+  <h2>Approval</h2>
+  <div class="out" id="approval-detail"></div>
+  <label>Six-digit PIN</label>
+  <input id="approval-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
+  <button class="btn green" id="approve-btn" onclick="decideApproval('accept')">Approve once</button>
+  <button class="btn red" id="decline-btn" onclick="decideApproval('decline')">Decline</button>
+  <button class="btn small gray" onclick="openApprovals()">Back to approvals</button>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+if (window.top !== window.self) {
+  try { window.top.location.href = window.location.href; } catch (e) {}
+  throw new Error("framed");
+}
+var TOKEN = "";
+var RELAY = "";
+var BASE = "";
+var currentTaskId = null;
+var currentApproval = null;
+
+function $(id) { return document.getElementById(id); }
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+function show(id) {
+  var views = document.querySelectorAll(".view");
+  for (var i = 0; i < views.length; i++) views[i].className = "view";
+  $(id).className = "view active";
+  window.scrollTo(0, 0);
+}
+var toastTimer = null;
+function toast(msg) {
+  var t = $("toast");
+  t.textContent = msg;
+  t.style.display = "block";
+  if (toastTimer) clearTimeout(toastTimer);
+  toastTimer = setTimeout(function () { t.style.display = "none"; }, 4000);
+}
+function busy(id, on) { $(id).disabled = !!on; }
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+function idem() {
+  return "web-" + Date.now().toString(36) + "-" + Math.floor(Math.random() * 2176782336).toString(36);
+}
+function pinValue(id) {
+  var pin = $(id).value.trim();
+  if (!/^\d{6}$/.test(pin)) { toast("Enter the six-digit PIN"); return null; }
+  return pin;
+}
+function tooLong(text) {
+  var bytes = text.length;
+  try { bytes = new TextEncoder().encode(text).length; } catch (e) {}
+  if (bytes > 4096) { toast("Too long — shorten the text (4KB max)"); return true; }
+  return false;
+}
+function friendly(code, status) {
+  if (status === 401) return "Token rejected — reopen your private link";
+  if (status === 429) return "Rate limited or locked — wait a minute";
+  if (status === 403) return "Rejected: wrong PIN or expired challenge";
+  if (status === 409) return "Not possible in the task's current state";
+  if (status === 404) return "Not found — it may have expired";
+  if (status === 503) return "Relay temporarily unavailable";
+  return "Request failed (" + (code || status) + ")";
+}
+function api(method, path, body) {
+  var opts = { method: method, headers: { "authorization": "Bearer " + TOKEN } };
+  if (body !== undefined) {
+    opts.headers["content-type"] = "application/json";
+    opts.body = JSON.stringify(body);
+  }
+  return fetch(BASE + path, opts).then(
+    function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (!res.ok) {
+          var err = (data && data.error) || {};
+          throw { message: friendly(err.code, res.status), status: res.status };
+        }
+        return data;
+      });
+    },
+    function () { throw { message: "No connection to relay", status: 0 }; }
+  );
+}
+function ago(iso) {
+  var ms = Date.now() - Date.parse(iso);
+  if (!isFinite(ms) || ms < 0) return "just now";
+  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
+  if (ms < 3600000) return Math.round(ms / 60000) + "m ago";
+  return Math.round(ms / 3600000) + "h ago";
+}
+
+function saveToken() {
+  var value = $("setup-token").value.trim();
+  if (value.length < 32) { toast("That does not look like the Watch token"); return; }
+  TOKEN = value;
+  try { localStorage.setItem("cw_t", TOKEN); } catch (e) {}
+  $("setup-token").value = "";
+  if (!BASE) { toast("Relay unknown — open your private link once first"); return; }
+  show("v-home");
+}
+
+function openStatus() {
+  show("v-status");
+  $("status-out").textContent = "Checking…";
+  api("GET", "/watch/health").then(function (h) {
+    var line1 = "Relay: OK";
+    var line2 = h.agentOnline ? "PC bridge: ONLINE" : "PC bridge: OFFLINE";
+    var line3 = h.agentLastSeenAt ? "Last heartbeat: " + ago(h.agentLastSeenAt) : "No heartbeat recorded";
+    $("status-out").textContent = line1 + "\n" + line2 + "\n" + line3;
+  }).catch(function (e) {
+    $("status-out").textContent = "Error: " + e.message;
+  });
+}
+
+var lastChatId = null;
+function sendChat() {
+  var text = $("chat-text").value.trim();
+  if (!text) { toast("Enter a question first"); return; }
+  if (tooLong(text)) return;
+  busy("chat-send", true);
+  $("chat-out").textContent = "Sending…";
+  api("POST", "/watch/commands", { idempotencyKey: idem(), type: "chat", payload: { text: text } })
+    .then(function (cmd) {
+      lastChatId = cmd.id;
+      try { localStorage.setItem("cw_last_cmd", cmd.id); } catch (e) {}
+      return pollChat(cmd, 0, 0);
+    })
+    .catch(function (e) { $("chat-out").textContent = "Error: " + e.message; })
+    .then(function () { busy("chat-send", false); });
+}
+function checkChat() {
+  var id = lastChatId;
+  if (!id) { try { id = localStorage.getItem("cw_last_cmd"); } catch (e) {} }
+  if (!id) { toast("No previous question to check"); return; }
+  lastChatId = id;
+  busy("chat-check", true);
+  $("chat-out").textContent = "Checking…";
+  api("GET", "/watch/commands/" + id)
+    .then(function (cmd) { return pollChat(cmd, 10, 0); })
+    .catch(function (e) { $("chat-out").textContent = "Error: " + e.message; })
+    .then(function () { busy("chat-check", false); });
+}
+function pollChat(cmd, tries, failures) {
+  if (cmd.status === "completed") {
+    $("chat-out").textContent = (cmd.result && cmd.result.text) ? cmd.result.text : "(no answer text)";
+    return;
+  }
+  if (cmd.status === "failed") { $("chat-out").textContent = "Failed: " + (cmd.errorCode || "unknown error"); return; }
+  if (cmd.status === "cancelled" || cmd.status === "needs_review") {
+    $("chat-out").textContent = "Ended with status: " + cmd.status;
+    return;
+  }
+  if (tries >= 14) { $("chat-out").textContent = "Still working — tap Check answer in a bit."; return; }
+  $("chat-out").textContent = "Waiting for PC… (" + cmd.status + ")";
+  var wait = tries < 4 ? 4000 : 8000;
+  return sleep(wait).then(function () {
+    return api("GET", "/watch/commands/" + cmd.id).then(
+      function (next) { return pollChat(next, tries + 1, 0); },
+      function (e) {
+        if ((e.status === 429 || e.status === 0) && failures < 3) {
+          return sleep(10000).then(function () { return pollChat(cmd, tries + 1, failures + 1); });
+        }
+        throw e;
+      }
+    );
+  });
+}
+
+function openTasks() {
+  show("v-tasks");
+  $("tasks-list").innerHTML = "Loading…";
+  api("GET", "/watch/tasks").then(function (data) {
+    var tasks = data.tasks || [];
+    if (tasks.length === 0) { $("tasks-list").innerHTML = "No tasks yet."; return; }
+    window.__tasks = tasks;
+    var html = "";
+    for (var i = 0; i < tasks.length; i++) {
+      var t = tasks[i];
+      html += '<div class="card" onclick="openTask(' + i + ')">' +
+        '<span class="badge' + (t.status === "running" || t.status === "queued" ? " on" : (t.status === "waiting_approval" ? " warn" : "")) + '">' + esc(t.status) + "</span>" +
+        '<div>' + esc((t.latestSummary || "(no summary)").slice(0, 140)) + "</div>" +
+        '<div class="meta">Updated ' + esc(ago(t.updatedAt)) + "</div></div>";
+    }
+    $("tasks-list").innerHTML = html;
+  }).catch(function (e) { $("tasks-list").innerHTML = esc("Error: " + e.message); });
+}
+function openTask(index) {
+  var t = (window.__tasks || [])[index];
+  if (!t) return;
+  currentTaskId = t.id;
+  loadTask();
+}
+function loadTask() {
+  show("v-task");
+  $("cancel-pin").value = "";
+  $("task-detail").textContent = "Loading…";
+  api("GET", "/watch/tasks/" + currentTaskId).then(function (t) {
+    $("task-detail").textContent =
+      "Status: " + t.status + "\nUpdated: " + ago(t.updatedAt) + "\n\n" + (t.latestSummary || "(no summary)");
+  }).catch(function (e) { $("task-detail").textContent = "Error: " + e.message; });
+}
+function cancelTask() {
+  var pin = pinValue("cancel-pin");
+  if (!pin || !currentTaskId) return;
+  var taskId = currentTaskId;
+  busy("cancel-send", true);
+  api("POST", "/watch/challenges", { purpose: "task_cancel", taskId: taskId })
+    .then(function (ch) {
+      return api("POST", "/watch/tasks/" + taskId + "/cancel", {
+        idempotencyKey: idem(),
+        challengeId: ch.challengeId,
+        challengeToken: ch.challengeToken,
+        pin: pin
+      });
+    })
+    .then(function () {
+      $("cancel-pin").value = "";
+      toast("Cancellation requested");
+      loadTask();
+    })
+    .catch(function (e) { toast(e.message); })
+    .then(function () { busy("cancel-send", false); });
+}
+
+function startTask() {
+  var text = $("task-text").value.trim();
+  if (!text) { toast("Enter the task instruction"); return; }
+  if (tooLong(text)) return;
+  var pin = pinValue("task-pin");
+  if (!pin) return;
+  busy("task-send", true);
+  $("task-out").textContent = "Requesting challenge…";
+  api("POST", "/watch/challenges", { purpose: "task_start", text: text })
+    .then(function (ch) {
+      $("task-out").textContent = "Submitting task…";
+      return api("POST", "/watch/commands", {
+        idempotencyKey: idem(),
+        type: "codex_task",
+        payload: { text: text },
+        challengeId: ch.challengeId,
+        challengeToken: ch.challengeToken,
+        pin: pin
+      });
+    })
+    .then(function (cmd) {
+      $("task-pin").value = "";
+      $("task-out").textContent = "Accepted. Command status: " + cmd.status + "\nCheck Task Status for progress and approvals.";
+    })
+    .catch(function (e) { $("task-out").textContent = "Error: " + e.message; })
+    .then(function () { busy("task-send", false); });
+}
+
+function openApprovals() {
+  show("v-approvals");
+  $("approvals-list").innerHTML = "Loading…";
+  api("GET", "/watch/approvals").then(function (data) {
+    var approvals = data.approvals || [];
+    if (approvals.length === 0) { $("approvals-list").innerHTML = "No pending approvals."; return; }
+    window.__approvals = approvals;
+    var html = "";
+    for (var i = 0; i < approvals.length; i++) {
+      var a = approvals[i];
+      html += '<div class="card" onclick="openApproval(' + i + ')">' +
+        '<span class="badge warn">' + esc(a.kind) + "</span>" +
+        '<div>' + esc((a.summary || "").slice(0, 140)) + "</div>" +
+        '<div class="meta">Expires ' + esc(expiresIn(a.expiresAt)) + "</div></div>";
+    }
+    $("approvals-list").innerHTML = html;
+  }).catch(function (e) { $("approvals-list").innerHTML = esc("Error: " + e.message); });
+}
+function expiresIn(iso) {
+  var ms = Date.parse(iso) - Date.now();
+  if (!isFinite(ms) || ms <= 0) return "now";
+  return "in " + Math.max(1, Math.round(ms / 1000)) + "s";
+}
+function openApproval(index) {
+  currentApproval = (window.__approvals || [])[index] || null;
+  if (!currentApproval) return;
+  show("v-approval");
+  $("approval-pin").value = "";
+  $("approval-detail").textContent =
+    "Type: " + currentApproval.kind + "\nExpires " + expiresIn(currentApproval.expiresAt) +
+    "\n\n" + (currentApproval.summary || "(no summary)");
+}
+function decideApproval(decision) {
+  var pin = pinValue("approval-pin");
+  if (!pin || !currentApproval) return;
+  var approvalId = currentApproval.id;
+  busy("approve-btn", true);
+  busy("decline-btn", true);
+  api("POST", "/watch/challenges", { purpose: "approval", approvalId: approvalId })
+    .then(function (ch) {
+      return api("POST", "/watch/approvals/" + approvalId + "/decision", {
+        decision: decision,
+        challengeId: ch.challengeId,
+        challengeToken: ch.challengeToken,
+        pin: pin
+      });
+    })
+    .then(function () {
+      $("approval-pin").value = "";
+      toast(decision === "accept" ? "Approved once" : "Declined");
+      openApprovals();
+    })
+    .catch(function (e) { toast(e.message); })
+    .then(function () { busy("approve-btn", false); busy("decline-btn", false); });
+}
+
+(function init() {
+  var target = "v-setup";
+  try {
+    var hash = location.hash || "";
+    var mt = hash.match(/[#&]t=([^&]+)/);
+    var mr = hash.match(/[#&]r=([^&]+)/);
+    if (mt) {
+      try { TOKEN = decodeURIComponent(mt[1]); } catch (e) { TOKEN = mt[1]; }
+      try { localStorage.setItem("cw_t", TOKEN); } catch (e) {}
+    } else {
+      try { TOKEN = localStorage.getItem("cw_t") || ""; } catch (e) {}
+    }
+    if (mr) {
+      var host = "";
+      try { host = decodeURIComponent(mr[1]); } catch (e) { host = mr[1]; }
+      if (/^[a-z0-9-]+\.supabase\.co$/.test(host)) {
+        RELAY = host;
+        try { localStorage.setItem("cw_r", RELAY); } catch (e) {}
+      }
+    } else {
+      try { RELAY = localStorage.getItem("cw_r") || ""; } catch (e) {}
+    }
+    if (mt || mr) {
+      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
+    }
+    if (RELAY) {
+      BASE = "https://" + RELAY + "/functions/v1/watchweb";
+    } else if (location.hostname.slice(-12) === ".supabase.co") {
+      BASE = location.origin + "/functions/v1/remote";
+    }
+    if (TOKEN && BASE) target = "v-home";
+  } catch (e) {}
+  show(target);
+})();
+</script>
+</body>
+</html>
