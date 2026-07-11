@@ -6,188 +6,178 @@
 <meta name="disabled-adaptations" content="watch">
 <meta name="format-detection" content="telephone=no">
 <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https:; base-uri 'none'; form-action 'none'">
-<title>Codex Remote</title>
+<title>ChatGPT Work</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
   html { font-size: 16px; }
   body { background: #000; color: #fff; font-family: -apple-system, system-ui, sans-serif; padding: 8px 8px 24px; }
-  h1 { font-size: 1.15rem; text-align: center; padding: 6px 0 10px; color: #7ee787; }
-  h2 { font-size: 1.05rem; padding: 2px 0 8px; color: #9ecbff; }
+  h1 { color: #7ee787; font-size: 1.15rem; padding: 6px 0 10px; text-align: center; }
+  h2 { color: #9ecbff; font-size: 1.05rem; padding: 2px 0 8px; }
   .view { display: none; }
   .view.active { display: block; }
-  .btn { display: block; width: 100%; min-height: 52px; font-size: 1.1rem; font-weight: 600; color: #fff;
-         background: #1f6feb; border: 0; border-radius: 14px; margin: 8px 0; padding: 12px; }
+  .btn { background: #1f6feb; border: 0; border-radius: 14px; color: #fff; display: block; font-size: 1.1rem;
+         font-weight: 600; margin: 8px 0; min-height: 52px; padding: 12px; width: 100%; }
   .btn:disabled { opacity: 0.45; }
   .btn.gray { background: #30363d; }
   .btn.green { background: #238636; }
-  .btn.red { background: #b62324; }
-  .btn.small { min-height: 42px; font-size: 0.95rem; padding: 8px; }
-  textarea, input { width: 100%; font-size: 1.1rem; color: #fff; background: #161b22; border: 1px solid #30363d;
-                    border-radius: 12px; padding: 12px; margin: 6px 0; }
-  textarea { min-height: 84px; }
+  .btn.small { font-size: 0.95rem; min-height: 42px; padding: 8px; }
+  input { background: #161b22; border: 1px solid #30363d; border-radius: 12px; color: #fff; font-size: 1.1rem;
+          margin: 6px 0; padding: 12px; width: 100%; }
   input.pin { font-size: 1.5rem; letter-spacing: 0.4em; text-align: center; }
-  label { font-size: 0.9rem; color: #8b949e; display: block; margin-top: 8px; }
-  .out { white-space: pre-wrap; word-break: break-word; font-size: 1.05rem; line-height: 1.45;
-         background: #0d1117; border: 1px solid #30363d; border-radius: 12px; padding: 12px; margin: 8px 0; min-height: 40px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 12px; padding: 12px; margin: 8px 0; }
-  .card .meta { font-size: 0.85rem; color: #8b949e; margin-top: 4px; }
-  .badge { display: inline-block; font-size: 0.8rem; font-weight: 700; border-radius: 8px; padding: 2px 8px; background: #30363d; }
-  .badge.on { background: #238636; }
-  .badge.off { background: #b62324; }
-  .badge.warn { background: #9e6a03; }
-  #toast { position: fixed; left: 8px; right: 8px; bottom: 8px; background: #b62324; color: #fff; font-size: 0.95rem;
-           border-radius: 12px; padding: 10px 12px; display: none; z-index: 9; text-align: center; }
-  .note { font-size: 0.85rem; color: #8b949e; line-height: 1.4; margin: 6px 0; }
+  label { color: #8b949e; display: block; font-size: 0.9rem; margin-top: 8px; }
+  .note { color: #8b949e; font-size: 0.85rem; line-height: 1.4; margin: 6px 0; }
+  .out { background: #0d1117; border: 1px solid #30363d; border-radius: 12px; font-size: 1.05rem;
+         line-height: 1.45; margin: 8px 0; min-height: 48px; padding: 12px; white-space: pre-wrap; word-break: break-word; }
+  #toast { background: #b62324; border-radius: 12px; bottom: 8px; color: #fff; display: none; font-size: 0.95rem;
+           left: 8px; padding: 10px 12px; position: fixed; right: 8px; text-align: center; z-index: 9; }
 </style>
 </head>
 <body>
-<h1>Codex Remote</h1>
+<h1>ChatGPT Work</h1>
 
 <div class="view" id="v-setup">
-  <h2>Setup</h2>
-  <p class="note">No access token found. Reopen this page from the link in your Mail message — keep that email. The field below is a desktop fallback only.</p>
-  <input id="setup-token" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="Watch token">
-  <button class="btn" onclick="saveToken()">Save token</button>
+  <h2>Private link needed</h2>
+  <p class="out" id="setup-error">Reopen the private Watch link to load the pinned conversations.</p>
 </div>
 
-<div class="view" id="v-home">
-  <button class="btn gray" onclick="openStatus()">Connection Status</button>
-  <button class="btn" onclick="show('v-chat')">Ask AI</button>
-  <button class="btn" onclick="openTasks()">Task Status</button>
-  <button class="btn" onclick="openApprovals()">Pending Approvals</button>
-  <button class="btn green" onclick="show('v-newtask')">New Codex Task</button>
+<div class="view" id="v-pinned">
+  <h2>Pinned</h2>
+  <div id="pinned-list"></div>
+  <button class="btn small gray" id="check-connection" type="button">Check Connection</button>
+  <div class="out" id="connection-output">Connection status not checked.</div>
 </div>
 
-<div class="view" id="v-status">
-  <h2>Connection</h2>
-  <div class="out" id="status-out">Checking…</div>
-  <button class="btn small gray" onclick="openStatus()">Refresh</button>
-  <button class="btn small gray" onclick="show('v-home')">Back</button>
-</div>
-
-<div class="view" id="v-chat">
-  <h2>Ask AI</h2>
-  <textarea id="chat-text" placeholder="Question…"></textarea>
-  <button class="btn" id="chat-send" onclick="sendChat()">Send</button>
-  <button class="btn small gray" id="chat-check" onclick="checkChat()">Check answer</button>
-  <div class="out" id="chat-out">Answers appear here.</div>
-  <button class="btn small gray" onclick="show('v-home')">Back</button>
-</div>
-
-<div class="view" id="v-tasks">
-  <h2>Tasks</h2>
-  <div id="tasks-list" class="note">Loading…</div>
-  <button class="btn small gray" onclick="openTasks()">Refresh</button>
-  <button class="btn small gray" onclick="show('v-home')">Back</button>
-</div>
-
-<div class="view" id="v-task">
-  <h2>Task</h2>
-  <div class="out" id="task-detail"></div>
-  <label>PIN to cancel this task</label>
-  <input id="cancel-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
-  <button class="btn red" id="cancel-send" onclick="cancelTask()">Cancel Task</button>
-  <button class="btn small gray" onclick="openTasks()">Back to tasks</button>
-</div>
-
-<div class="view" id="v-newtask">
-  <h2>New Codex Task</h2>
-  <textarea id="task-text" placeholder="Instruction for the PC workspace…"></textarea>
-  <label>Six-digit PIN</label>
-  <input id="task-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
-  <button class="btn green" id="task-send" onclick="startTask()">Start Task</button>
-  <div class="out" id="task-out">Task result status appears here.</div>
-  <button class="btn small gray" onclick="show('v-home')">Back</button>
-</div>
-
-<div class="view" id="v-approvals">
-  <h2>Approvals</h2>
-  <div id="approvals-list" class="note">Loading…</div>
-  <button class="btn small gray" onclick="openApprovals()">Refresh</button>
-  <button class="btn small gray" onclick="show('v-home')">Back</button>
-</div>
-
-<div class="view" id="v-approval">
-  <h2>Approval</h2>
-  <div class="out" id="approval-detail"></div>
-  <label>Six-digit PIN</label>
-  <input id="approval-pin" class="pin" type="tel" inputmode="numeric" pattern="[0-9]*" maxlength="6" autocomplete="off" placeholder="••••••">
-  <button class="btn green" id="approve-btn" onclick="decideApproval('accept')">Approve once</button>
-  <button class="btn red" id="decline-btn" onclick="decideApproval('decline')">Decline</button>
-  <button class="btn small gray" onclick="openApprovals()">Back to approvals</button>
+<div class="view" id="v-conversation">
+  <h2 id="conversation-title"></h2>
+  <p class="note">Tap the message field, then choose Dictation on Apple Watch. Dictation never starts automatically.</p>
+  <form id="compose-form">
+    <label for="message-text">Message to Codex</label>
+    <input id="message-text" name="message" type="text" inputmode="text"
+      autocapitalize="sentences" autocomplete="off"
+      aria-label="Message to Codex" placeholder="Tap, then dictate" required>
+    <label for="message-pin">Six-digit PIN</label>
+    <input id="message-pin" class="pin" type="tel" inputmode="numeric"
+      pattern="[0-9]*" maxlength="6" autocomplete="off" required>
+    <button class="btn green" id="send-message" type="submit">Send</button>
+  </form>
+  <div class="out" id="reply-output">Replies appear here.</div>
+  <button class="btn small" id="check-reply" type="button">Check Reply</button>
+  <button class="btn small gray" id="back-to-pinned" type="button">Back</button>
 </div>
 
 <div id="toast"></div>
 
 <script>
 "use strict";
+var PRIVATE_HASH = location.hash || "";
+var privateUrlCleared = PRIVATE_HASH === "";
+if (PRIVATE_HASH) {
+  try {
+    history.replaceState(null, "", location.pathname + location.search);
+    privateUrlCleared = true;
+  } catch (e) {}
+}
 if (window.top !== window.self) {
-  try { window.top.location.href = window.location.href; } catch (e) {}
   throw new Error("framed");
 }
+
 var TOKEN = "";
 var RELAY = "";
 var BASE = "";
-var currentTaskId = null;
-var currentApproval = null;
+var CONVERSATIONS = [];
+var selected = null;
+var readyForNetwork = false;
+var operationGeneration = 0;
+var latestPersistedSendGeneration = Object.create(null);
+var REQUEST_MAX_BYTES = 4096;
+var MAX_IDEMPOTENCY_KEY = "web-zzzzzzzz-zzzzzz";
+var MAX_CHALLENGE_ID = "00000000-0000-4000-8000-000000000000";
+var MAX_CHALLENGE_TOKEN = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 function $(id) { return document.getElementById(id); }
-function esc(s) {
-  return String(s).replace(/[&<>"']/g, function (c) {
-    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
-  });
-}
 function show(id) {
   var views = document.querySelectorAll(".view");
   for (var i = 0; i < views.length; i++) views[i].className = "view";
   $(id).className = "view active";
   window.scrollTo(0, 0);
 }
+
 var toastTimer = null;
-function toast(msg) {
-  var t = $("toast");
-  t.textContent = msg;
-  t.style.display = "block";
+function toast(message) {
+  var element = $("toast");
+  element.textContent = message;
+  element.style.display = "block";
   if (toastTimer) clearTimeout(toastTimer);
-  toastTimer = setTimeout(function () { t.style.display = "none"; }, 4000);
+  toastTimer = setTimeout(function () { element.style.display = "none"; }, 4000);
 }
 function busy(id, on) { $(id).disabled = !!on; }
-function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
-function idem() {
+function sleep(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+function requestId() {
   return "web-" + Date.now().toString(36) + "-" + Math.floor(Math.random() * 2176782336).toString(36);
 }
-function pinValue(id) {
-  var pin = $(id).value.trim();
-  if (!/^\d{6}$/.test(pin)) { toast("Enter the six-digit PIN"); return null; }
-  return pin;
+function utf8ByteLength(value) {
+  if (typeof TextEncoder === "function") return new TextEncoder().encode(value).byteLength;
+  var bytes = 0;
+  for (var index = 0; index < value.length; index++) {
+    var code = value.charCodeAt(index);
+    if (code < 128) {
+      bytes += 1;
+    } else if (code < 2048) {
+      bytes += 2;
+    } else if (code >= 55296 && code <= 56319) {
+      var next = value.charCodeAt(index + 1);
+      if (next >= 56320 && next <= 57343) {
+        bytes += 4;
+        index += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
-function tooLong(text) {
-  var bytes = text.length;
-  try { bytes = new TextEncoder().encode(text).length; } catch (e) {}
-  if (bytes > 4096) { toast("Too long — shorten the text (4KB max)"); return true; }
-  return false;
+function serializedRequest(body) {
+  try {
+    var serialized = JSON.stringify(body);
+    if (typeof serialized !== "string") return null;
+    var bytes = utf8ByteLength(serialized);
+    return bytes <= REQUEST_MAX_BYTES ? serialized : null;
+  } catch (e) {
+    return null;
+  }
+}
+function requestTooLarge(body) {
+  return serializedRequest(body) === null;
 }
 function friendly(code, status) {
   if (status === 401) return "Token rejected — reopen your private link";
+  if (status === 413) return "Request too large — shorten the message (4KB request limit)";
   if (status === 429) return "Rate limited or locked — wait a minute";
   if (status === 403) return "Rejected: wrong PIN or expired challenge";
-  if (status === 409) return "Not possible in the task's current state";
-  if (status === 404) return "Not found — it may have expired";
+  if (status === 404) return "Reply not found — it may have expired";
   if (status === 503) return "Relay temporarily unavailable";
   return "Request failed (" + (code || status) + ")";
 }
 function api(method, path, body) {
-  var opts = { method: method, headers: { "authorization": "Bearer " + TOKEN } };
+  if (!readyForNetwork) return Promise.reject({ message: "Private link was not cleared", status: 0 });
+  var options = { method: method, headers: { "authorization": "Bearer " + TOKEN } };
   if (body !== undefined) {
-    opts.headers["content-type"] = "application/json";
-    opts.body = JSON.stringify(body);
+    var serialized = serializedRequest(body);
+    if (serialized === null) {
+      return Promise.reject({ message: friendly("request_too_large", 413), status: 413 });
+    }
+    options.headers["content-type"] = "application/json";
+    options.body = serialized;
   }
-  return fetch(BASE + path, opts).then(
-    function (res) {
-      return res.json().catch(function () { return null; }).then(function (data) {
-        if (!res.ok) {
-          var err = (data && data.error) || {};
-          throw { message: friendly(err.code, res.status), status: res.status };
+  return fetch(BASE + path, options).then(
+    function (response) {
+      return response.json().catch(function () { return null; }).then(function (data) {
+        if (!response.ok) {
+          var error = (data && data.error) || {};
+          var code = typeof error === "string" ? error : error.code;
+          throw { message: friendly(code, response.status), status: response.status };
         }
         return data;
       });
@@ -195,264 +185,333 @@ function api(method, path, body) {
     function () { throw { message: "No connection to relay", status: 0 }; }
   );
 }
-function ago(iso) {
-  var ms = Date.now() - Date.parse(iso);
-  if (!isFinite(ms) || ms < 0) return "just now";
-  if (ms < 60000) return Math.round(ms / 1000) + "s ago";
-  if (ms < 3600000) return Math.round(ms / 60000) + "m ago";
-  return Math.round(ms / 3600000) + "h ago";
+
+function parseConversations(encoded) {
+  try {
+    if (typeof encoded !== "string" || !/^[A-Za-z0-9_-]+$/.test(encoded)) return null;
+    var base64 = encoded.replace(/-/g, "+").replace(/_/g, "/");
+    while (base64.length % 4) base64 += "=";
+    var binary = atob(base64);
+    var escaped = "";
+    for (var index = 0; index < binary.length; index++) {
+      escaped += "%" + ("00" + binary.charCodeAt(index).toString(16)).slice(-2);
+    }
+    var input = JSON.parse(decodeURIComponent(escaped));
+    if (!Array.isArray(input) || input.length !== 4) return null;
+    var expectedTitles = ["Make 5k a month", "Review DUI documents", "College", "One action until done"];
+    var seen = Object.create(null);
+    var result = [];
+    for (var i = 0; i < input.length; i++) {
+      var item = input[i];
+      if (!item || typeof item !== "object" || Array.isArray(item)) return null;
+      var fields = Object.keys(item).sort();
+      if (fields.length !== 2 || fields[0] !== "key" || fields[1] !== "title") return null;
+      if (item.title !== expectedTitles[i]) return null;
+      if (typeof item.key !== "string" || !/^[a-z0-9_]{1,32}$/.test(item.key) || seen[item.key]) return null;
+      seen[item.key] = true;
+      result.push({ title: item.title, key: item.key });
+    }
+    return result;
+  } catch (e) {
+    return null;
+  }
 }
 
-function saveToken() {
-  var value = $("setup-token").value.trim();
-  if (value.length < 32) { toast("That does not look like the Watch token"); return; }
-  TOKEN = value;
-  try { localStorage.setItem("cw_t", TOKEN); } catch (e) {}
-  $("setup-token").value = "";
-  if (!BASE) { toast("Relay unknown — open your private link once first"); return; }
-  show("v-home");
+function parseBootstrap(hash) {
+  try {
+    if (typeof hash !== "string" || hash.charAt(0) !== "#") return null;
+    var pairs = hash.slice(1).split("&");
+    if (pairs.length !== 4) return null;
+    var values = Object.create(null);
+    var allowed = { v: true, t: true, r: true, c: true };
+    for (var i = 0; i < pairs.length; i++) {
+      var separator = pairs[i].indexOf("=");
+      if (separator < 1) return null;
+      var key = decodeURIComponent(pairs[i].slice(0, separator));
+      var value = decodeURIComponent(pairs[i].slice(separator + 1));
+      if (!allowed[key] || Object.prototype.hasOwnProperty.call(values, key)) return null;
+      values[key] = value;
+    }
+    if (values.v !== "1") return null;
+    return { token: values.t, relay: values.r, conversations: values.c };
+  } catch (e) {
+    return null;
+  }
+}
+function taskStorageKey(alias) { return "cw_task_" + alias; }
+function validTaskId(value) {
+  return typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+function savedTaskId(alias) {
+  var taskId = "";
+  try { taskId = localStorage.getItem(taskStorageKey(alias)) || ""; } catch (e) {}
+  return validTaskId(taskId) ? taskId : "";
+}
+function invalidateOperations() { operationGeneration += 1; }
+function beginOperation(conversationKey) {
+  operationGeneration += 1;
+  return { conversationKey: conversationKey, generation: operationGeneration };
+}
+function isCurrentOperation(operation) {
+  return !!selected
+    && selected.key === operation.conversationKey
+    && operation.generation === operationGeneration;
+}
+function operationOutput(operation, message) {
+  if (!isCurrentOperation(operation)) return false;
+  $("reply-output").textContent = message;
+  return true;
+}
+function operationBusy(operation, on) {
+  if (!isCurrentOperation(operation)) return;
+  busy("send-message", on);
+  $("check-reply").disabled = on || !savedTaskId(operation.conversationKey);
 }
 
-function openStatus() {
-  show("v-status");
-  $("status-out").textContent = "Checking…";
-  api("GET", "/watch/health").then(function (h) {
-    var line1 = "Relay: OK";
-    var line2 = h.agentOnline ? "PC bridge: ONLINE" : "PC bridge: OFFLINE";
-    var line3 = h.agentLastSeenAt ? "Last heartbeat: " + ago(h.agentLastSeenAt) : "No heartbeat recorded";
-    $("status-out").textContent = line1 + "\n" + line2 + "\n" + line3;
-  }).catch(function (e) {
-    $("status-out").textContent = "Error: " + e.message;
+function renderPinned() {
+  var list = $("pinned-list");
+  while (list.firstChild) list.removeChild(list.firstChild);
+  for (var i = 0; i < CONVERSATIONS.length; i++) {
+    (function (conversation) {
+      var button = document.createElement("button");
+      button.className = "btn";
+      button.type = "button";
+      button.textContent = conversation.title;
+      button.addEventListener("click", function () { openConversation(conversation); });
+      list.appendChild(button);
+    })(CONVERSATIONS[i]);
+  }
+}
+function renderConnection(health) {
+  var message;
+  var lastSeenIsString = health && typeof health.agentLastSeenAt === "string" && health.agentLastSeenAt !== "";
+  var lastSeenIsNull = health && health.agentLastSeenAt === null;
+  if (!health
+      || health.ok !== true
+      || typeof health.agentOnline !== "boolean"
+      || (!lastSeenIsString && !lastSeenIsNull)
+      || (health.agentOnline && !lastSeenIsString)) {
+    $("connection-output").textContent = "Relay status unavailable. PC bridge status unknown.";
+    return false;
+  }
+  if (health.agentOnline) {
+    message = "Relay online. PC heartbeat: " + health.agentLastSeenAt;
+  } else if (lastSeenIsString) {
+    message = "Relay is reachable, but the PC bridge is offline. Last heartbeat: " + health.agentLastSeenAt;
+  } else {
+    message = "Relay is reachable, but the PC bridge has not reported a heartbeat.";
+  }
+  $("connection-output").textContent = message;
+  return true;
+}
+function checkConnection() {
+  if ($("check-connection").disabled) return;
+  busy("check-connection", true);
+  $("connection-output").textContent = "Checking connection…";
+  api("GET", "/watch/health").then(function (health) {
+    renderConnection(health);
+  }).catch(function (error) {
+    $("connection-output").textContent = "Relay unavailable: " + (error.message || "Request failed");
+  }).then(function () {
+    busy("check-connection", false);
   });
 }
+function openPinned() {
+  invalidateOperations();
+  selected = null;
+  $("message-pin").value = "";
+  show("v-pinned");
+}
+function openConversation(conversation) {
+  invalidateOperations();
+  selected = conversation;
+  $("conversation-title").textContent = conversation.title;
+  $("message-text").value = "";
+  $("message-pin").value = "";
+  $("send-message").disabled = false;
+  var taskId = savedTaskId(conversation.key);
+  $("check-reply").disabled = !taskId;
+  $("reply-output").textContent = taskId
+    ? "A previous reply is available. Tap Check Reply."
+    : "Replies appear here.";
+  show("v-conversation");
+  $("message-text").focus();
+}
 
-var lastChatId = null;
-function sendChat() {
-  var text = $("chat-text").value.trim();
-  if (!text) { toast("Enter a question first"); return; }
-  if (tooLong(text)) return;
-  busy("chat-send", true);
-  $("chat-out").textContent = "Sending…";
-  api("POST", "/watch/commands", { idempotencyKey: idem(), type: "chat", payload: { text: text } })
-    .then(function (cmd) {
-      lastChatId = cmd.id;
-      try { localStorage.setItem("cw_last_cmd", cmd.id); } catch (e) {}
-      return pollChat(cmd, 0, 0);
-    })
-    .catch(function (e) { $("chat-out").textContent = "Error: " + e.message; })
-    .then(function () { busy("chat-send", false); });
-}
-function checkChat() {
-  var id = lastChatId;
-  if (!id) { try { id = localStorage.getItem("cw_last_cmd"); } catch (e) {} }
-  if (!id) { toast("No previous question to check"); return; }
-  lastChatId = id;
-  busy("chat-check", true);
-  $("chat-out").textContent = "Checking…";
-  api("GET", "/watch/commands/" + id)
-    .then(function (cmd) { return pollChat(cmd, 10, 0); })
-    .catch(function (e) { $("chat-out").textContent = "Error: " + e.message; })
-    .then(function () { busy("chat-check", false); });
-}
-function pollChat(cmd, tries, failures) {
-  if (cmd.status === "completed") {
-    $("chat-out").textContent = (cmd.result && cmd.result.text) ? cmd.result.text : "(no answer text)";
-    return;
+function renderTask(task, operation) {
+  if (!isCurrentOperation(operation)) return true;
+  var summary = task.latestSummary || "(no reply text)";
+  if (task.status === "completed") {
+    $("reply-output").textContent = summary;
+    return true;
   }
-  if (cmd.status === "failed") { $("chat-out").textContent = "Failed: " + (cmd.errorCode || "unknown error"); return; }
-  if (cmd.status === "cancelled" || cmd.status === "needs_review") {
-    $("chat-out").textContent = "Ended with status: " + cmd.status;
-    return;
+  if (task.status === "failed") {
+    $("reply-output").textContent = "Failed: " + summary;
+    return true;
   }
-  if (tries >= 14) { $("chat-out").textContent = "Still working — tap Check answer in a bit."; return; }
-  $("chat-out").textContent = "Waiting for PC… (" + cmd.status + ")";
-  var wait = tries < 4 ? 4000 : 8000;
-  return sleep(wait).then(function () {
-    return api("GET", "/watch/commands/" + cmd.id).then(
-      function (next) { return pollChat(next, tries + 1, 0); },
-      function (e) {
-        if ((e.status === 429 || e.status === 0) && failures < 3) {
-          return sleep(10000).then(function () { return pollChat(cmd, tries + 1, failures + 1); });
-        }
-        throw e;
+  if (task.status === "cancelled") {
+    $("reply-output").textContent = "Cancelled: " + summary;
+    return true;
+  }
+  if (task.status === "needs_review") {
+    $("reply-output").textContent = "Needs review on the PC: " + summary;
+    return true;
+  }
+  if (task.status === "interrupted") {
+    $("reply-output").textContent = "Interrupted: " + summary;
+    return true;
+  }
+  $("reply-output").textContent = "Waiting for the PC… (" + task.status + ")\n" + summary;
+  return false;
+}
+function pageIsVisible() {
+  return document.hidden !== true && document.visibilityState !== "hidden";
+}
+function pausePolling(operation) {
+  if (!isCurrentOperation(operation)) return;
+  operationOutput(operation, "Polling paused while this page is hidden. Return here and tap Check Reply.");
+  operationBusy(operation, false);
+}
+function pollTask(taskId, tries, operation) {
+  if (!isCurrentOperation(operation)) return Promise.resolve();
+  if (!pageIsVisible()) {
+    pausePolling(operation);
+    return Promise.resolve();
+  }
+  return api("GET", "/watch/tasks/" + taskId).then(function (task) {
+    if (!isCurrentOperation(operation) || renderTask(task, operation)) return;
+    if (tries >= 5) {
+      $("reply-output").textContent += "\nStill working — tap Check Reply in a bit.";
+      return;
+    }
+    return sleep(3000).then(function () {
+      if (!isCurrentOperation(operation)) return;
+      if (!pageIsVisible()) {
+        pausePolling(operation);
+        return;
       }
-    );
+      return pollTask(taskId, tries + 1, operation);
+    });
   });
 }
 
-function openTasks() {
-  show("v-tasks");
-  $("tasks-list").innerHTML = "Loading…";
-  api("GET", "/watch/tasks").then(function (data) {
-    var tasks = data.tasks || [];
-    if (tasks.length === 0) { $("tasks-list").innerHTML = "No tasks yet."; return; }
-    window.__tasks = tasks;
-    var html = "";
-    for (var i = 0; i < tasks.length; i++) {
-      var t = tasks[i];
-      html += '<div class="card" onclick="openTask(' + i + ')">' +
-        '<span class="badge' + (t.status === "running" || t.status === "queued" ? " on" : (t.status === "waiting_approval" ? " warn" : "")) + '">' + esc(t.status) + "</span>" +
-        '<div>' + esc((t.latestSummary || "(no summary)").slice(0, 140)) + "</div>" +
-        '<div class="meta">Updated ' + esc(ago(t.updatedAt)) + "</div></div>";
+function sendMessage(event) {
+  event.preventDefault();
+  if (!selected || $("send-message").disabled) return false;
+  var text = $("message-text").value.trim();
+  var pin = $("message-pin").value.trim();
+  if (!text) { toast("Enter a message first"); return false; }
+  if (!/^\d{6}$/.test(pin)) { toast("Enter the six-digit PIN"); return false; }
+
+  var bound = { text: text, conversationKey: selected.key };
+  var idempotencyKey = requestId();
+  var challengeBody = {
+    purpose: "task_start",
+    text: bound.text,
+    conversationKey: bound.conversationKey
+  };
+  var maximumCommandBody = {
+    idempotencyKey: MAX_IDEMPOTENCY_KEY,
+    type: "codex_task",
+    payload: bound,
+    challengeId: MAX_CHALLENGE_ID,
+    challengeToken: MAX_CHALLENGE_TOKEN,
+    pin: pin
+  };
+  $("message-pin").value = "";
+  if (requestTooLarge(challengeBody) || requestTooLarge(maximumCommandBody)) {
+    pin = "";
+    toast(friendly("request_too_large", 413));
+    return false;
+  }
+  var operation = beginOperation(bound.conversationKey);
+  operationBusy(operation, true);
+  operationOutput(operation, "Requesting challenge…");
+  api("POST", "/watch/challenges", challengeBody).then(function (challenge) {
+    operationOutput(operation, "Sending…");
+    var commandRequest = api("POST", "/watch/commands", {
+      idempotencyKey: idempotencyKey,
+      type: "codex_task",
+      payload: bound,
+      challengeId: challenge.challengeId,
+      challengeToken: challenge.challengeToken,
+      pin: pin
+    });
+    pin = "";
+    return commandRequest;
+  }).then(function (command) {
+    var taskId = command && command.taskId;
+    if (!validTaskId(taskId)) throw { message: "Relay returned an invalid task", status: 0 };
+    var persistedGeneration = latestPersistedSendGeneration[bound.conversationKey];
+    if (persistedGeneration === undefined || operation.generation > persistedGeneration) {
+      try {
+        localStorage.setItem(taskStorageKey(bound.conversationKey), taskId);
+        latestPersistedSendGeneration[bound.conversationKey] = operation.generation;
+      } catch (e) {}
     }
-    $("tasks-list").innerHTML = html;
-  }).catch(function (e) { $("tasks-list").innerHTML = esc("Error: " + e.message); });
-}
-function openTask(index) {
-  var t = (window.__tasks || [])[index];
-  if (!t) return;
-  currentTaskId = t.id;
-  loadTask();
-}
-function loadTask() {
-  show("v-task");
-  $("cancel-pin").value = "";
-  $("task-detail").textContent = "Loading…";
-  api("GET", "/watch/tasks/" + currentTaskId).then(function (t) {
-    $("task-detail").textContent =
-      "Status: " + t.status + "\nUpdated: " + ago(t.updatedAt) + "\n\n" + (t.latestSummary || "(no summary)");
-  }).catch(function (e) { $("task-detail").textContent = "Error: " + e.message; });
-}
-function cancelTask() {
-  var pin = pinValue("cancel-pin");
-  if (!pin || !currentTaskId) return;
-  var taskId = currentTaskId;
-  busy("cancel-send", true);
-  api("POST", "/watch/challenges", { purpose: "task_cancel", taskId: taskId })
-    .then(function (ch) {
-      return api("POST", "/watch/tasks/" + taskId + "/cancel", {
-        idempotencyKey: idem(),
-        challengeId: ch.challengeId,
-        challengeToken: ch.challengeToken,
-        pin: pin
-      });
-    })
-    .then(function () {
-      $("cancel-pin").value = "";
-      toast("Cancellation requested");
-      loadTask();
-    })
-    .catch(function (e) { toast(e.message); })
-    .then(function () { busy("cancel-send", false); });
+    if (!isCurrentOperation(operation)) return;
+    $("message-text").value = "";
+    return pollTask(taskId, 0, operation);
+  }).catch(function (error) {
+    pin = "";
+    operationOutput(operation, "Error: " + (error.message || "Request failed"));
+  }).then(function () {
+    operationBusy(operation, false);
+  });
+  return false;
 }
 
-function startTask() {
-  var text = $("task-text").value.trim();
-  if (!text) { toast("Enter the task instruction"); return; }
-  if (tooLong(text)) return;
-  var pin = pinValue("task-pin");
-  if (!pin) return;
-  busy("task-send", true);
-  $("task-out").textContent = "Requesting challenge…";
-  api("POST", "/watch/challenges", { purpose: "task_start", text: text })
-    .then(function (ch) {
-      $("task-out").textContent = "Submitting task…";
-      return api("POST", "/watch/commands", {
-        idempotencyKey: idem(),
-        type: "codex_task",
-        payload: { text: text },
-        challengeId: ch.challengeId,
-        challengeToken: ch.challengeToken,
-        pin: pin
-      });
-    })
-    .then(function (cmd) {
-      $("task-pin").value = "";
-      $("task-out").textContent = "Accepted. Command status: " + cmd.status + "\nCheck Task Status for progress and approvals.";
-    })
-    .catch(function (e) { $("task-out").textContent = "Error: " + e.message; })
-    .then(function () { busy("task-send", false); });
+function checkReply() {
+  if (!selected || $("check-reply").disabled) return;
+  var conversationKey = selected.key;
+  var taskId = "";
+  try { taskId = localStorage.getItem("cw_task_" + selected.key) || ""; } catch (e) {}
+  if (!validTaskId(taskId)) { toast("No previous task to check"); return; }
+  var operation = beginOperation(conversationKey);
+  operationBusy(operation, true);
+  operationOutput(operation, "Checking…");
+  pollTask(taskId, 0, operation).catch(function (error) {
+    operationOutput(operation, "Error: " + (error.message || "Request failed"));
+  }).then(function () { operationBusy(operation, false); });
 }
 
-function openApprovals() {
-  show("v-approvals");
-  $("approvals-list").innerHTML = "Loading…";
-  api("GET", "/watch/approvals").then(function (data) {
-    var approvals = data.approvals || [];
-    if (approvals.length === 0) { $("approvals-list").innerHTML = "No pending approvals."; return; }
-    window.__approvals = approvals;
-    var html = "";
-    for (var i = 0; i < approvals.length; i++) {
-      var a = approvals[i];
-      html += '<div class="card" onclick="openApproval(' + i + ')">' +
-        '<span class="badge warn">' + esc(a.kind) + "</span>" +
-        '<div>' + esc((a.summary || "").slice(0, 140)) + "</div>" +
-        '<div class="meta">Expires ' + esc(expiresIn(a.expiresAt)) + "</div></div>";
-    }
-    $("approvals-list").innerHTML = html;
-  }).catch(function (e) { $("approvals-list").innerHTML = esc("Error: " + e.message); });
-}
-function expiresIn(iso) {
-  var ms = Date.parse(iso) - Date.now();
-  if (!isFinite(ms) || ms <= 0) return "now";
-  return "in " + Math.max(1, Math.round(ms / 1000)) + "s";
-}
-function openApproval(index) {
-  currentApproval = (window.__approvals || [])[index] || null;
-  if (!currentApproval) return;
-  show("v-approval");
-  $("approval-pin").value = "";
-  $("approval-detail").textContent =
-    "Type: " + currentApproval.kind + "\nExpires " + expiresIn(currentApproval.expiresAt) +
-    "\n\n" + (currentApproval.summary || "(no summary)");
-}
-function decideApproval(decision) {
-  var pin = pinValue("approval-pin");
-  if (!pin || !currentApproval) return;
-  var approvalId = currentApproval.id;
-  busy("approve-btn", true);
-  busy("decline-btn", true);
-  api("POST", "/watch/challenges", { purpose: "approval", approvalId: approvalId })
-    .then(function (ch) {
-      return api("POST", "/watch/approvals/" + approvalId + "/decision", {
-        decision: decision,
-        challengeId: ch.challengeId,
-        challengeToken: ch.challengeToken,
-        pin: pin
-      });
-    })
-    .then(function () {
-      $("approval-pin").value = "";
-      toast(decision === "accept" ? "Approved once" : "Declined");
-      openApprovals();
-    })
-    .catch(function (e) { toast(e.message); })
-    .then(function () { busy("approve-btn", false); busy("decline-btn", false); });
-}
+$("compose-form").addEventListener("submit", sendMessage);
+$("check-connection").addEventListener("click", checkConnection);
+$("check-reply").addEventListener("click", checkReply);
+$("back-to-pinned").addEventListener("click", openPinned);
 
 (function init() {
-  var target = "v-setup";
+  var hash = PRIVATE_HASH;
+  var bootstrap = parseBootstrap(hash);
+
+  if (!privateUrlCleared) {
+    $("setup-error").textContent = "Could not clear the private link. Close this page and try again.";
+    show("v-setup");
+    return;
+  }
+  if (!bootstrap
+      || !/^[A-Za-z0-9_-]{43}$/.test(bootstrap.token)
+      || !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.supabase\.co$/.test(bootstrap.relay)) {
+    $("setup-error").textContent = "The private Watch link is missing or invalid. Reopen the original link.";
+    show("v-setup");
+    return;
+  }
+  CONVERSATIONS = parseConversations(bootstrap.conversations);
+  if (!CONVERSATIONS) {
+    $("setup-error").textContent = "The private Watch link is missing or invalid. Reopen the original link.";
+    show("v-setup");
+    return;
+  }
+  TOKEN = bootstrap.token;
+  RELAY = bootstrap.relay;
+  BASE = "https://" + RELAY + "/functions/v1/watchweb";
   try {
-    var hash = location.hash || "";
-    var mt = hash.match(/[#&]t=([^&]+)/);
-    var mr = hash.match(/[#&]r=([^&]+)/);
-    if (mt) {
-      try { TOKEN = decodeURIComponent(mt[1]); } catch (e) { TOKEN = mt[1]; }
-      try { localStorage.setItem("cw_t", TOKEN); } catch (e) {}
-    } else {
-      try { TOKEN = localStorage.getItem("cw_t") || ""; } catch (e) {}
-    }
-    if (mr) {
-      var host = "";
-      try { host = decodeURIComponent(mr[1]); } catch (e) { host = mr[1]; }
-      if (/^[a-z0-9-]+\.supabase\.co$/.test(host)) {
-        RELAY = host;
-        try { localStorage.setItem("cw_r", RELAY); } catch (e) {}
-      }
-    } else {
-      try { RELAY = localStorage.getItem("cw_r") || ""; } catch (e) {}
-    }
-    if (mt || mr) {
-      try { history.replaceState(null, "", location.pathname + location.search); } catch (e) {}
-    }
-    if (RELAY) {
-      BASE = "https://" + RELAY + "/functions/v1/watchweb";
-    } else if (location.hostname.slice(-12) === ".supabase.co") {
-      BASE = location.origin + "/functions/v1/remote";
-    }
-    if (TOKEN && BASE) target = "v-home";
+    localStorage.setItem("cw_t", TOKEN);
+    localStorage.setItem("cw_r", RELAY);
   } catch (e) {}
-  show(target);
+  readyForNetwork = true;
+  renderPinned();
+  show("v-pinned");
 })();
 </script>
 </body>
