@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Multi Health Consulting — Free Florida Health Insurance Quotes | Cotizaciones Gratis</title>
+<meta name="description" content="See if you qualify for a low-cost or $0/month health plan in Florida. Free help from licensed agents, in English y Español. Check your options in 60 seconds.">
+<style>
+  :root{
+    --navy:#0b3556; --navy2:#12466f; --teal:#0e9f9f; --green:#16a34a; --green2:#12873d;
+    --bg:#f5f8fb; --card:#ffffff; --text:#1c2b3a; --muted:#5b6b7b; --line:#e3eaf1; --err:#d43a3a;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;color:var(--text);background:var(--bg);line-height:1.55}
+  img{max-width:100%}
+  a{color:var(--teal)}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+
+  /* Header */
+  header{background:#fff;border-bottom:1px solid var(--line);position:sticky;top:0;z-index:50}
+  .head-in{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:12px 0}
+  .logo{font-weight:800;font-size:1.05rem;color:var(--navy);letter-spacing:.2px}
+  .logo span{color:var(--teal)}
+  .head-right{display:flex;align-items:center;gap:10px}
+  .phone-btn{background:var(--navy);color:#fff;text-decoration:none;font-weight:700;padding:8px 14px;border-radius:8px;font-size:.9rem;white-space:nowrap}
+  .lang{display:flex;border:1px solid var(--line);border-radius:8px;overflow:hidden}
+  .lang button{border:0;background:#fff;padding:7px 12px;font-weight:700;font-size:.85rem;cursor:pointer;color:var(--muted)}
+  .lang button.on{background:var(--teal);color:#fff}
+
+  /* Hero */
+  .hero{background:linear-gradient(160deg,var(--navy) 0%,var(--navy2) 60%,#175a8c 100%);color:#fff;padding:40px 0 56px}
+  .hero-grid{display:grid;grid-template-columns:1.05fr .95fr;gap:36px;align-items:center}
+  .hero h1{font-size:2.15rem;line-height:1.18;font-weight:800;margin-bottom:14px}
+  .hero h1 em{color:#7ee0d2;font-style:normal}
+  .hero p.sub{font-size:1.06rem;color:#d7e5f0;margin-bottom:18px;max-width:34rem}
+  .ticks{list-style:none;display:grid;gap:9px;margin-bottom:10px}
+  .ticks li{padding-left:28px;position:relative;color:#eaf3fa;font-size:.98rem}
+  .ticks li::before{content:"✓";position:absolute;left:0;top:0;width:20px;height:20px;background:var(--green);border-radius:50%;color:#fff;font-size:.75rem;display:flex;align-items:center;justify-content:center;font-weight:800}
+  .micro{font-size:.75rem;color:#9fb8ca;margin-top:14px;max-width:34rem}
+
+  /* Form card */
+  .card{background:var(--card);border-radius:14px;box-shadow:0 12px 40px rgba(6,30,52,.35);padding:26px 24px;color:var(--text)}
+  .card h2{font-size:1.22rem;color:var(--navy);margin-bottom:4px}
+  .card .sub2{font-size:.9rem;color:var(--muted);margin-bottom:16px}
+  .progress{height:6px;background:var(--line);border-radius:99px;margin-bottom:18px;overflow:hidden}
+  .progress i{display:block;height:100%;background:var(--green);width:33%;transition:width .3s;border-radius:99px}
+  .step{display:none}
+  .step.on{display:block;animation:fade .25s ease}
+  @keyframes fade{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
+  label{display:block;font-weight:700;font-size:.9rem;margin:12px 0 6px;color:var(--navy)}
+  input[type=text],input[type=tel],input[type=email],select{width:100%;padding:13px 14px;border:1.5px solid var(--line);border-radius:9px;font-size:1rem;background:#fff;color:var(--text)}
+  input:focus,select:focus{outline:none;border-color:var(--teal)}
+  .row2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .btn{width:100%;margin-top:16px;background:var(--green);color:#fff;border:0;border-radius:10px;padding:15px;font-size:1.05rem;font-weight:800;cursor:pointer;transition:background .15s}
+  .btn:hover{background:var(--green2)}
+  .btn.ghost{background:none;color:var(--muted);font-weight:600;font-size:.85rem;padding:8px;margin-top:6px}
+  .btn.ghost:hover{background:none;text-decoration:underline}
+  .field-err{color:var(--err);font-size:.8rem;margin-top:4px;display:none}
+  .consent{display:flex;gap:10px;align-items:flex-start;margin-top:14px;font-size:.72rem;color:var(--muted);line-height:1.45}
+  .consent input{margin-top:3px;width:16px;height:16px;flex:none}
+  .secure{display:flex;align-items:center;gap:6px;justify-content:center;font-size:.75rem;color:var(--muted);margin-top:12px}
+  .thanks{text-align:center;padding:26px 6px;display:none}
+  .thanks .big{width:64px;height:64px;border-radius:50%;background:var(--green);color:#fff;font-size:1.8rem;display:flex;align-items:center;justify-content:center;margin:0 auto 14px}
+  .thanks h3{color:var(--navy);font-size:1.3rem;margin-bottom:8px}
+  .thanks p{color:var(--muted);font-size:.95rem}
+
+  /* Sections */
+  section{padding:52px 0}
+  .sec-title{text-align:center;font-size:1.7rem;color:var(--navy);font-weight:800;margin-bottom:8px}
+  .sec-sub{text-align:center;color:var(--muted);max-width:40rem;margin:0 auto 34px}
+  .steps3{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+  .s3{background:#fff;border:1px solid var(--line);border-radius:12px;padding:24px 20px;text-align:center}
+  .s3 .n{width:44px;height:44px;border-radius:50%;background:var(--teal);color:#fff;font-weight:800;font-size:1.1rem;display:flex;align-items:center;justify-content:center;margin:0 auto 12px}
+  .s3 h3{color:var(--navy);font-size:1.03rem;margin-bottom:6px}
+  .s3 p{color:var(--muted);font-size:.9rem}
+  .band{background:#fff;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}
+  .benefits{display:grid;grid-template-columns:repeat(2,1fr);gap:16px 28px;max-width:56rem;margin:0 auto}
+  .b-item{display:flex;gap:12px;align-items:flex-start}
+  .b-item .ic{flex:none;width:38px;height:38px;border-radius:9px;background:#e6f6f4;color:var(--teal);display:flex;align-items:center;justify-content:center;font-size:1.1rem}
+  .b-item h4{color:var(--navy);font-size:.98rem;margin-bottom:2px}
+  .b-item p{color:var(--muted);font-size:.88rem}
+  .faq{max-width:44rem;margin:0 auto}
+  .faq details{background:#fff;border:1px solid var(--line);border-radius:10px;padding:16px 18px;margin-bottom:10px}
+  .faq summary{font-weight:700;color:var(--navy);cursor:pointer;font-size:.98rem}
+  .faq p{margin-top:10px;color:var(--muted);font-size:.92rem}
+  .cta2{text-align:center}
+  .cta2 .btn{max-width:340px;margin:10px auto 0}
+
+  footer{background:var(--navy);color:#b9cbda;padding:34px 0 40px;font-size:.78rem;line-height:1.6}
+  footer .foot-logo{color:#fff;font-weight:800;font-size:1rem;margin-bottom:10px}
+  footer p{margin-bottom:10px;max-width:70rem}
+  footer a{color:#8fd8ce}
+
+  @media(max-width:840px){
+    .hero-grid{grid-template-columns:1fr;gap:26px}
+    .hero{padding:28px 0 40px}
+    .hero h1{font-size:1.65rem}
+    .steps3{grid-template-columns:1fr}
+    .benefits{grid-template-columns:1fr}
+    .row2{grid-template-columns:1fr}
+    .phone-btn{font-size:.8rem;padding:7px 10px}
+  }
+</style>
+</head>
+<body>
+
+<!-- Hidden static form so Netlify detects the fields at deploy time -->
+<form name="aca-lead" netlify netlify-honeypot="bot-field" hidden>
+  <input name="zip"><input name="household_size"><input name="income_range"><input name="who_needs_coverage">
+  <input name="first_name"><input name="last_name"><input name="phone"><input name="email">
+  <input name="preferred_language"><input name="consent_given"><input name="consent_text">
+  <input name="consent_timestamp"><input name="page_url"><input name="user_agent"><input name="bot-field">
+</form>
+
+<header>
+  <div class="wrap head-in">
+    <div class="logo">Multi Health <span>Consulting</span></div>
+    <div class="head-right">
+      <div class="lang">
+        <button id="btn-en" onclick="setLang('en')">EN</button>
+        <button id="btn-es" onclick="setLang('es')">ES</button>
+      </div>
+      <a class="phone-btn" id="phoneLink" href="tel:"><span data-i18n="call">Call</span> <span class="js-phone"></span></a>
+    </div>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap hero-grid">
+    <div>
+      <h1 data-i18n-html="h1">You may qualify for a <em>$0/month</em> health plan in Florida</h1>
+      <p class="sub" data-i18n="sub">More than 9 in 10 Florida Marketplace enrollees get financial help with their premium. Find out what you qualify for in about 60 seconds — free, no obligation.</p>
+      <ul class="ticks">
+        <li data-i18n="t1">100% free help from licensed Florida agents</li>
+        <li data-i18n="t2">Service in English and Spanish</li>
+        <li data-i18n="t3">Compare plans from major insurance companies</li>
+        <li data-i18n="t4">No obligation — checking your options costs nothing</li>
+      </ul>
+      <p class="micro" data-i18n="micro">$0 premium plans are available only to applicants who qualify based on household income and other factors. Savings vary. Not everyone qualifies.</p>
+    </div>
+
+    <div class="card" id="formCard">
+      <div id="formView">
+        <h2 data-i18n="fTitle">Check your options</h2>
+        <p class="sub2" data-i18n="fSub">Takes about 60 seconds · Free</p>
+        <div class="progress"><i id="bar"></i></div>
+
+        <form id="leadForm" autocomplete="on">
+          <input type="text" name="bot-field" style="display:none" tabindex="-1" autocomplete="off">
+
+          <!-- Step 1 -->
+          <div class="step on" id="step1">
+            <label for="zip" data-i18n="zipL">What's your ZIP code?</label>
+            <input type="text" id="zip" name="zip" inputmode="numeric" maxlength="5" placeholder="33101">
+            <div class="field-err" id="zipErr" data-i18n="zipE">Please enter a valid 5-digit ZIP code.</div>
+            <button type="button" class="btn" onclick="goStep(2)" data-i18n="c1">Continue →</button>
+          </div>
+
+          <!-- Step 2 -->
+          <div class="step" id="step2">
+            <label data-i18n="hhL">How many people live in your household?</label>
+            <select id="household" name="household_size">
+              <option value="1">1</option><option value="2">2</option><option value="3">3</option>
+              <option value="4">4</option><option value="5">5</option><option value="6+">6+</option>
+            </select>
+            <label data-i18n="incL">Estimated household income per year</label>
+            <select id="income" name="income_range">
+              <option value="under_15k" data-i18n="inc1">Less than $15,000</option>
+              <option value="15k_30k">$15,000 – $30,000</option>
+              <option value="30k_50k">$30,000 – $50,000</option>
+              <option value="50k_75k">$50,000 – $75,000</option>
+              <option value="over_75k" data-i18n="inc5">More than $75,000</option>
+              <option value="not_sure" data-i18n="inc6">Not sure</option>
+            </select>
+            <label data-i18n="whoL">Who needs coverage?</label>
+            <select id="who" name="who_needs_coverage">
+              <option value="me" data-i18n="who1">Just me</option>
+              <option value="me_spouse" data-i18n="who2">Me + spouse/partner</option>
+              <option value="family" data-i18n="who3">My family</option>
+            </select>
+            <button type="button" class="btn" onclick="goStep(3)" data-i18n="c2">Continue →</button>
+            <button type="button" class="btn ghost" onclick="goStep(1)" data-i18n="back">← Back</button>
+          </div>
+
+          <!-- Step 3 -->
+          <div class="step" id="step3">
+            <div class="row2">
+              <div>
+                <label for="fname" data-i18n="fnL">First name</label>
+                <input type="text" id="fname" name="first_name">
+              </div>
+              <div>
+                <label for="lname" data-i18n="lnL">Last name</label>
+                <input type="text" id="lname" name="last_name">
+              </div>
+            </div>
+            <label for="phone" data-i18n="phL">Mobile phone</label>
+            <input type="tel" id="phone" name="phone" inputmode="tel" placeholder="(305) 555-0123">
+            <div class="field-err" id="phoneErr" data-i18n="phE">Please enter a valid 10-digit phone number.</div>
+            <label for="email" data-i18n="emL">Email</label>
+            <input type="email" id="email" name="email" placeholder="you@email.com">
+            <div class="field-err" id="emailErr" data-i18n="emE">Please enter a valid email address.</div>
+
+            <div class="consent">
+              <input type="checkbox" id="consent">
+              <span id="consentText" data-i18n="consent">By checking this box and clicking "See My Options", I give my express written consent for Multi Health Consulting and its licensed insurance agents to contact me about health insurance options at the phone number and email I provided, including by automated technology, prerecorded messages, and SMS text messages. Message and data rates may apply. My consent is not a condition of any purchase, and I can revoke it at any time (reply STOP to texts). I have read and agree to the <a href="privacy.html" target="_blank">Privacy Policy</a>.</span>
+            </div>
+            <div class="field-err" id="consentErr" data-i18n="conE">Please check the consent box to continue.</div>
+
+            <button type="submit" class="btn" data-i18n="c3">See My Options</button>
+            <button type="button" class="btn ghost" onclick="goStep(2)" data-i18n="back2">← Back</button>
+            <div class="secure">🔒 <span data-i18n="secure">Your information is secure and will never be sold to third parties.</span></div>
+          </div>
+        </form>
+      </div>
+
+      <div class="thanks" id="thanksView">
+        <div class="big">✓</div>
+        <h3 data-i18n="thTitle">You're all set!</h3>
+        <p data-i18n="thBody">A licensed agent from Multi Health Consulting will call you shortly to go over your options. Save our number so you don't miss the call:</p>
+        <p style="margin-top:10px;font-weight:800;color:var(--navy);font-size:1.15rem"><span class="js-phone"></span></p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<section>
+  <div class="wrap">
+    <h2 class="sec-title" data-i18n="howT">How it works</h2>
+    <p class="sec-sub" data-i18n="howS">Getting covered is simpler than you think — and our help is always free.</p>
+    <div class="steps3">
+      <div class="s3"><div class="n">1</div><h3 data-i18n="s1T">Tell us about yourself</h3><p data-i18n="s1B">Answer a few quick questions — about 60 seconds. No documents needed to start.</p></div>
+      <div class="s3"><div class="n">2</div><h3 data-i18n="s2T">We find your best options</h3><p data-i18n="s2B">A licensed agent compares plans and financial help you may qualify for.</p></div>
+      <div class="s3"><div class="n">3</div><h3 data-i18n="s3T">Enroll with confidence</h3><p data-i18n="s3B">We handle the paperwork and stay with you all year — claims questions, renewals, everything.</p></div>
+    </div>
+  </div>
+</section>
+
+<section class="band">
+  <div class="wrap">
+    <h2 class="sec-title" data-i18n="whyT">Why families choose us</h2>
+    <p class="sec-sub" data-i18n="whyS">We work for you, not for any single insurance company.</p>
+    <div class="benefits">
+      <div class="b-item"><div class="ic">💵</div><div><h4 data-i18n="b1T">Always free</h4><p data-i18n="b1B">Our service costs you nothing — agents are paid by insurance companies, never by you.</p></div></div>
+      <div class="b-item"><div class="ic">🗣️</div><div><h4 data-i18n="b2T">English y Español</h4><p data-i18n="b2B">Get every question answered in the language you're most comfortable with.</p></div></div>
+      <div class="b-item"><div class="ic">🧭</div><div><h4 data-i18n="b3T">Real licensed agents</h4><p data-i18n="b3B">Florida-licensed professionals — not a call center reading a script.</p></div></div>
+      <div class="b-item"><div class="ic">🛡️</div><div><h4 data-i18n="b4T">Year-round support</h4><p data-i18n="b4B">Lost your card? Bill looks wrong? Life changed? Call us — we handle it.</p></div></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap faq">
+    <h2 class="sec-title" data-i18n="faqT">Common questions</h2>
+    <p class="sec-sub"></p>
+    <details><summary data-i18n="q1">Is this really free?</summary><p data-i18n="a1">Yes. Licensed agents are compensated by insurance companies, so our help costs you nothing — and your monthly premium is the same whether you use an agent or not.</p></details>
+    <details><summary data-i18n="q2">Do I qualify for a $0/month plan?</summary><p data-i18n="a2">It depends on your household size, income, and other factors. Many Florida families qualify for large subsidies that can bring premiums to $0/month — the only way to know is to check. Not everyone qualifies.</p></details>
+    <details><summary data-i18n="q3">Can I enroll right now, or do I have to wait?</summary><p data-i18n="a3">Outside the annual Open Enrollment Period, you can still enroll if you've had a qualifying life event — like losing other coverage, moving, getting married, or having a baby. We'll check for free.</p></details>
+    <details><summary data-i18n="q4">What information do I need?</summary><p data-i18n="a4">To see your options: just your ZIP code, household size, and estimated income. To enroll: basic info like dates of birth and, for some, immigration documents. Your agent walks you through everything.</p></details>
+    <div class="cta2"><button class="btn" onclick="document.getElementById('formCard').scrollIntoView({behavior:'smooth'});" data-i18n="cta2">Check My Options — Free</button></div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="foot-logo">Multi Health Consulting</div>
+    <p id="licLine">Multi Health Consulting is a licensed health insurance agency. [FL Agency License #: ADD YOUR LICENSE NUMBER]</p>
+    <p data-i18n="d1">This is a solicitation for insurance. Submitting your information means a licensed insurance agent may contact you by phone, text, or email to discuss health insurance options.</p>
+    <p data-i18n="d2">Attention: This website is operated by Multi Health Consulting and is not the Health Insurance Marketplace® website. We are not affiliated with or endorsed by the U.S. government or the federal or state Marketplace. We do not offer every plan available in your area. Please visit HealthCare.gov or call 1-800-318-2596 for information on all of your options.</p>
+    <p data-i18n="d3">$0 premium health plans are available only to applicants who qualify for premium tax credits based on household income and other eligibility factors. Savings and eligibility vary. Not everyone will qualify.</p>
+    <p><a href="privacy.html" data-i18n="priv">Privacy Policy</a> · © <span id="yr"></span> Multi Health Consulting</p>
+  </div>
+</footer>
+
+<script>
+/* ====== EDIT THESE ====== */
+const CONFIG = {
+  phone: "(305) 555-0123",           // <-- REPLACE with your real business number
+  phoneHref: "tel:+13055550123",     // <-- REPLACE, digits only after tel:+1
+  leadEmail: "luccasb2613@proton.me" // <-- where leads are emailed (FormSubmit; used on GitHub Pages hosting)
+};
+/* ======================== */
+
+const I18N = {
+  es: {
+    call:"Llame",
+    h1:'Usted podría calificar para un plan médico de <em>$0/mes</em> en Florida',
+    sub:"Más de 9 de cada 10 inscritos en el Mercado de Salud en Florida reciben ayuda económica con su prima. Descubra para qué califica en unos 60 segundos — gratis y sin compromiso.",
+    t1:"Ayuda 100% gratis de agentes licenciados en Florida",
+    t2:"Servicio en español e inglés",
+    t3:"Compare planes de las principales aseguradoras",
+    t4:"Sin compromiso — revisar sus opciones no cuesta nada",
+    micro:"Los planes con prima de $0 están disponibles solo para solicitantes que califican según el ingreso del hogar y otros factores. Los ahorros varían. No todos califican.",
+    fTitle:"Revise sus opciones", fSub:"Toma unos 60 segundos · Gratis",
+    zipL:"¿Cuál es su código postal?", zipE:"Ingrese un código postal válido de 5 dígitos.",
+    c1:"Continuar →", hhL:"¿Cuántas personas viven en su hogar?",
+    incL:"Ingreso anual estimado del hogar", inc1:"Menos de $15,000", inc5:"Más de $75,000", inc6:"No estoy seguro",
+    whoL:"¿Quién necesita cobertura?", who1:"Solo yo", who2:"Yo + esposo(a)/pareja", who3:"Mi familia",
+    c2:"Continuar →", back:"← Atrás", back2:"← Atrás",
+    fnL:"Nombre", lnL:"Apellido", phL:"Teléfono celular", phE:"Ingrese un número de teléfono válido de 10 dígitos.",
+    emL:"Correo electrónico", emE:"Ingrese un correo electrónico válido.",
+    consent:'Al marcar esta casilla y hacer clic en "Ver Mis Opciones", doy mi consentimiento expreso por escrito para que Multi Health Consulting y sus agentes de seguros licenciados me contacten sobre opciones de seguro médico al teléfono y correo que proporcioné, incluso mediante tecnología automatizada, mensajes pregrabados y mensajes de texto SMS. Pueden aplicar tarifas de mensajes y datos. Mi consentimiento no es condición de ninguna compra y puedo revocarlo en cualquier momento (responda STOP a los textos). He leído y acepto la <a href="privacy.html" target="_blank">Política de Privacidad</a>.',
+    conE:"Marque la casilla de consentimiento para continuar.",
+    c3:"Ver Mis Opciones", secure:"Su información está segura y nunca será vendida a terceros.",
+    thTitle:"¡Listo!", thBody:"Un agente licenciado de Multi Health Consulting le llamará pronto para revisar sus opciones. Guarde nuestro número para no perder la llamada:",
+    howT:"Cómo funciona", howS:"Obtener cobertura es más simple de lo que piensa — y nuestra ayuda siempre es gratis.",
+    s1T:"Cuéntenos sobre usted", s1B:"Responda unas preguntas rápidas — unos 60 segundos. No necesita documentos para empezar.",
+    s2T:"Encontramos sus mejores opciones", s2B:"Un agente licenciado compara planes y la ayuda económica para la que podría calificar.",
+    s3T:"Inscríbase con confianza", s3B:"Nosotros manejamos el papeleo y le acompañamos todo el año — reclamos, renovaciones, todo.",
+    whyT:"Por qué las familias nos eligen", whyS:"Trabajamos para usted, no para una sola aseguradora.",
+    b1T:"Siempre gratis", b1B:"Nuestro servicio no le cuesta nada — a los agentes les pagan las aseguradoras, nunca usted.",
+    b2T:"Español e inglés", b2B:"Resuelva todas sus dudas en el idioma con el que se sienta más cómodo.",
+    b3T:"Agentes licenciados de verdad", b3B:"Profesionales licenciados en Florida — no un call center leyendo un guion.",
+    b4T:"Apoyo todo el año", b4B:"¿Perdió su tarjeta? ¿Una factura se ve mal? ¿Cambió su vida? Llámenos — lo resolvemos.",
+    faqT:"Preguntas frecuentes",
+    q1:"¿Es realmente gratis?", a1:"Sí. A los agentes licenciados les compensan las aseguradoras, así que nuestra ayuda no le cuesta nada — y su prima mensual es la misma con o sin agente.",
+    q2:"¿Califico para un plan de $0/mes?", a2:"Depende del tamaño de su hogar, su ingreso y otros factores. Muchas familias en Florida califican para subsidios grandes que pueden dejar la prima en $0/mes — la única forma de saberlo es revisar. No todos califican.",
+    q3:"¿Puedo inscribirme ahora o tengo que esperar?", a3:"Fuera del período anual de Inscripción Abierta, aún puede inscribirse si tuvo un evento de vida calificado — como perder otra cobertura, mudarse, casarse o tener un bebé. Lo revisamos gratis.",
+    q4:"¿Qué información necesito?", a4:"Para ver sus opciones: solo su código postal, tamaño del hogar e ingreso estimado. Para inscribirse: información básica como fechas de nacimiento y, para algunos, documentos migratorios. Su agente le guía en todo.",
+    cta2:"Revisar Mis Opciones — Gratis",
+    d1:"Esto es una solicitud de seguro. Al enviar su información, un agente de seguros licenciado puede contactarle por teléfono, texto o correo electrónico para hablar sobre opciones de seguro médico.",
+    d2:"Atención: Este sitio web es operado por Multi Health Consulting y no es el sitio web del Mercado de Seguros Médicos (Health Insurance Marketplace®). No estamos afiliados ni respaldados por el gobierno de EE. UU. ni por el Mercado federal o estatal. No ofrecemos todos los planes disponibles en su área. Visite HealthCare.gov o llame al 1-800-318-2596 para información sobre todas sus opciones.",
+    d3:"Los planes médicos con prima de $0 están disponibles solo para solicitantes que califican para créditos fiscales según el ingreso del hogar y otros factores de elegibilidad. Los ahorros y la elegibilidad varían. No todos calificarán.",
+    priv:"Política de Privacidad"
+  }
+};
+const EN = {}; // filled on load from DOM
+
+let lang = 'en';
+function grabEnglish(){
+  document.querySelectorAll('[data-i18n]').forEach(el=>{ EN[el.getAttribute('data-i18n')] = el.innerHTML; });
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{ EN[el.getAttribute('data-i18n-html')] = el.innerHTML; });
+}
+function setLang(l){
+  lang = l;
+  document.documentElement.lang = l;
+  const dict = l==='en' ? EN : I18N.es;
+  document.querySelectorAll('[data-i18n]').forEach(el=>{
+    const k = el.getAttribute('data-i18n');
+    if(dict[k]!==undefined) el.innerHTML = dict[k];
+  });
+  document.querySelectorAll('[data-i18n-html]').forEach(el=>{
+    const k = el.getAttribute('data-i18n-html');
+    if(dict[k]!==undefined) el.innerHTML = dict[k];
+  });
+  document.getElementById('btn-en').classList.toggle('on', l==='en');
+  document.getElementById('btn-es').classList.toggle('on', l==='es');
+}
+
+function goStep(n){
+  if(n===2){
+    const zip = document.getElementById('zip').value.trim();
+    const ok = /^\d{5}$/.test(zip);
+    document.getElementById('zipErr').style.display = ok?'none':'block';
+    if(!ok) return;
+  }
+  document.querySelectorAll('.step').forEach(s=>s.classList.remove('on'));
+  document.getElementById('step'+n).classList.add('on');
+  document.getElementById('bar').style.width = (n*33.4)+'%';
+}
+
+document.getElementById('leadForm').addEventListener('submit', async function(e){
+  e.preventDefault();
+  const phone = document.getElementById('phone').value.replace(/\D/g,'');
+  const email = document.getElementById('email').value.trim();
+  const fname = document.getElementById('fname').value.trim();
+  const consent = document.getElementById('consent').checked;
+  let ok = true;
+  const phOK = phone.length===10 || (phone.length===11 && phone.startsWith('1'));
+  document.getElementById('phoneErr').style.display = phOK?'none':'block'; if(!phOK) ok=false;
+  const emOK = /.+@.+\..+/.test(email);
+  document.getElementById('emailErr').style.display = emOK?'none':'block'; if(!emOK) ok=false;
+  document.getElementById('consentErr').style.display = consent?'none':'block'; if(!consent) ok=false;
+  if(!fname){ ok=false; document.getElementById('fname').style.borderColor='var(--err)'; }
+  if(!ok) return;
+
+  const data = {
+    'form-name':'aca-lead',
+    zip: document.getElementById('zip').value.trim(),
+    household_size: document.getElementById('household').value,
+    income_range: document.getElementById('income').value,
+    who_needs_coverage: document.getElementById('who').value,
+    first_name: fname,
+    last_name: document.getElementById('lname').value.trim(),
+    phone: document.getElementById('phone').value.trim(),
+    email: email,
+    preferred_language: lang,
+    consent_given: 'yes',
+    consent_text: document.getElementById('consentText').innerText,
+    consent_timestamp: new Date().toISOString(),
+    page_url: location.href,
+    user_agent: navigator.userAgent,
+    'bot-field': document.querySelector('input[name="bot-field"]').value
+  };
+  try{
+    const onNetlify = /\.netlify\.app$/.test(location.hostname);
+    if(onNetlify){
+      await fetch('/', {
+        method:'POST',
+        headers:{'Content-Type':'application/x-www-form-urlencoded'},
+        body: new URLSearchParams(data).toString()
+      });
+    }else{
+      const r = await fetch('https://formsubmit.co/ajax/' + CONFIG.leadEmail, {
+        method:'POST',
+        headers:{'Content-Type':'application/json','Accept':'application/json'},
+        body: JSON.stringify({
+          ...data,
+          _subject: 'NEW LEAD: ' + fname + ' ' + data.last_name + ' (' + data.zip + ', ' + data.income_range + ')',
+          _template: 'table',
+          _captcha: 'false',
+          _honey: data['bot-field']
+        })
+      });
+      if(!r.ok) console.warn('FormSubmit response not OK:', r.status);
+    }
+  }catch(err){ console.warn('Form post failed (expected on local preview):', err); }
+  document.getElementById('formView').style.display='none';
+  document.getElementById('thanksView').style.display='block';
+});
+
+// init
+grabEnglish();
+document.querySelectorAll('.js-phone').forEach(el=>el.textContent=CONFIG.phone);
+document.getElementById('phoneLink').href = CONFIG.phoneHref;
+document.getElementById('yr').textContent = new Date().getFullYear();
+setLang((navigator.language||'').toLowerCase().startsWith('es') ? 'es' : 'en');
+</script>
+</body>
+</html>
