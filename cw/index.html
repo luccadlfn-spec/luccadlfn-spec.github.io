@@ -40,6 +40,17 @@
   <p class="out" id="setup-error">Reopen the private Watch link to load the pinned conversations.</p>
 </div>
 
+<div class="view" id="v-unlock">
+  <h2>Unlock ChatGPT Work</h2>
+  <form id="unlock-form">
+    <label for="unlock-pin">4-digit PIN</label>
+    <input id="unlock-pin" class="pin" type="tel" inputmode="numeric"
+      pattern="[0-9]*" maxlength="4" autocomplete="off" required>
+    <button class="btn green" id="unlock-site" type="submit">Unlock</button>
+  </form>
+  <div class="out" id="unlock-output">Enter your PIN to continue.</div>
+</div>
+
 <div class="view" id="v-pinned">
   <h2>Pinned</h2>
   <div id="pinned-list"></div>
@@ -55,9 +66,6 @@
     <input id="message-text" name="message" type="text" inputmode="text"
       autocapitalize="sentences" autocomplete="off"
       aria-label="Message to Codex" placeholder="Tap, then dictate" required>
-    <label for="message-pin">Six-digit PIN</label>
-    <input id="message-pin" class="pin" type="tel" inputmode="numeric"
-      pattern="[0-9]*" maxlength="6" autocomplete="off" required>
     <button class="btn green" id="send-message" type="submit">Send</button>
   </form>
   <div class="out" id="reply-output">Replies appear here.</div>
@@ -85,8 +93,10 @@ var TOKEN = "";
 var RELAY = "";
 var BASE = "";
 var CONVERSATIONS = [];
+var PAGE_PIN = "";
 var selected = null;
 var readyForNetwork = false;
+var visitLockGeneration = 0;
 var operationGeneration = 0;
 var latestPersistedSendGeneration = Object.create(null);
 var REQUEST_MAX_BYTES = 4096;
@@ -268,6 +278,45 @@ function operationBusy(operation, on) {
   $("check-reply").disabled = on || !savedTaskId(operation.conversationKey);
 }
 
+function lockVisit(message) {
+  visitLockGeneration += 1;
+  invalidateOperations();
+  selected = null;
+  PAGE_PIN = "";
+  $("unlock-pin").value = "";
+  $("unlock-output").textContent = message || "Enter your PIN to continue.";
+  show("v-unlock");
+}
+function unlockVisit(event) {
+  event.preventDefault();
+  if ($("unlock-site").disabled) return false;
+  var pin = $("unlock-pin").value;
+  $("unlock-pin").value = "";
+  if (!/^[0-9]{4}$/.test(pin)) {
+    pin = "";
+    lockVisit("Enter the 4-digit PIN.");
+    return false;
+  }
+  busy("unlock-site", true);
+  $("unlock-output").textContent = "Unlocking…";
+  api("POST", "/watch/unlock", { pin: pin }).then(function () {
+    PAGE_PIN = pin;
+    pin = "";
+    renderPinned();
+    show("v-pinned");
+  }).catch(function (error) {
+    pin = "";
+    if (error && error.status === 403) {
+      lockVisit("PIN rejected. Enter the PIN again.");
+      return;
+    }
+    lockVisit("Unlock failed: " + (error.message || "Request failed"));
+  }).then(function () {
+    busy("unlock-site", false);
+  });
+  return false;
+}
+
 function renderPinned() {
   var list = $("pinned-list");
   while (list.firstChild) list.removeChild(list.firstChild);
@@ -319,7 +368,6 @@ function checkConnection() {
 function openPinned() {
   invalidateOperations();
   selected = null;
-  $("message-pin").value = "";
   show("v-pinned");
 }
 function openConversation(conversation) {
@@ -327,7 +375,6 @@ function openConversation(conversation) {
   selected = conversation;
   $("conversation-title").textContent = conversation.title;
   $("message-text").value = "";
-  $("message-pin").value = "";
   $("send-message").disabled = false;
   var taskId = savedTaskId(conversation.key);
   $("check-reply").disabled = !taskId;
@@ -398,12 +445,12 @@ function pollTask(taskId, tries, operation) {
 function sendMessage(event) {
   event.preventDefault();
   if (!selected || $("send-message").disabled) return false;
+  if (!/^[0-9]{4}$/.test(PAGE_PIN)) { lockVisit(); return false; }
   var text = $("message-text").value.trim();
-  var pin = $("message-pin").value.trim();
   if (!text) { toast("Enter a message first"); return false; }
-  if (!/^\d{6}$/.test(pin)) { toast("Enter the six-digit PIN"); return false; }
 
   var bound = { text: text, conversationKey: selected.key };
+  var sendLockGeneration = visitLockGeneration;
   var idempotencyKey = requestId();
   var challengeBody = {
     purpose: "task_start",
@@ -416,11 +463,9 @@ function sendMessage(event) {
     payload: bound,
     challengeId: MAX_CHALLENGE_ID,
     challengeToken: MAX_CHALLENGE_TOKEN,
-    pin: pin
+    pin: PAGE_PIN
   };
-  $("message-pin").value = "";
   if (requestTooLarge(challengeBody) || requestTooLarge(maximumCommandBody)) {
-    pin = "";
     toast(friendly("request_too_large", 413));
     return false;
   }
@@ -428,6 +473,9 @@ function sendMessage(event) {
   operationBusy(operation, true);
   operationOutput(operation, "Requesting challenge…");
   api("POST", "/watch/challenges", challengeBody).then(function (challenge) {
+    if (sendLockGeneration !== visitLockGeneration || !/^[0-9]{4}$/.test(PAGE_PIN)) {
+      throw { message: "Visit is locked", status: 0 };
+    }
     operationOutput(operation, "Sending…");
     var commandRequest = api("POST", "/watch/commands", {
       idempotencyKey: idempotencyKey,
@@ -435,10 +483,14 @@ function sendMessage(event) {
       payload: bound,
       challengeId: challenge.challengeId,
       challengeToken: challenge.challengeToken,
-      pin: pin
+      pin: PAGE_PIN
     });
-    pin = "";
-    return commandRequest;
+    return commandRequest.catch(function (error) {
+      if (error && error.status === 403 && sendLockGeneration === visitLockGeneration) {
+        lockVisit("Unlock expired or was rejected. Enter the PIN again.");
+      }
+      throw error;
+    });
   }).then(function (command) {
     var taskId = command && command.taskId;
     if (!validTaskId(taskId)) throw { message: "Relay returned an invalid task", status: 0 };
@@ -453,7 +505,6 @@ function sendMessage(event) {
     $("message-text").value = "";
     return pollTask(taskId, 0, operation);
   }).catch(function (error) {
-    pin = "";
     operationOutput(operation, "Error: " + (error.message || "Request failed"));
   }).then(function () {
     operationBusy(operation, false);
@@ -475,6 +526,7 @@ function checkReply() {
   }).then(function () { operationBusy(operation, false); });
 }
 
+$("unlock-form").addEventListener("submit", unlockVisit);
 $("compose-form").addEventListener("submit", sendMessage);
 $("check-connection").addEventListener("click", checkConnection);
 $("check-reply").addEventListener("click", checkReply);
@@ -505,13 +557,12 @@ $("back-to-pinned").addEventListener("click", openPinned);
   TOKEN = bootstrap.token;
   RELAY = bootstrap.relay;
   BASE = "https://" + RELAY + "/functions/v1/watchweb";
-  try {
-    localStorage.setItem("cw_t", TOKEN);
-    localStorage.setItem("cw_r", RELAY);
-  } catch (e) {}
+  // The token stays only in memory; it is never written to localStorage. The
+  // page re-derives it from the private link fragment on each open, so a
+  // persisted copy would be a dead write that leaks the bearer token to any
+  // reader of device storage without adding any function.
   readyForNetwork = true;
-  renderPinned();
-  show("v-pinned");
+  lockVisit();
 })();
 </script>
 </body>
