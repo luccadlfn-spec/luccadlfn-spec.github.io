@@ -674,7 +674,7 @@ llama_setting_meaning() {
     LLAMA_API_KEY) echo "serious|the password between the agent and the model server. Without it the model server answers any program on its network." ;;
     LLAMA_ARG_CTX_SIZE) echo "serious|how much text the model keeps in mind (LLM_CTX). Without it the model server takes the model's own maximum, which can need many GB more memory." ;;
     LLAMA_ARG_REPACK | LLAMA_ARG_NO_REPACK) echo "serious|the switch that keeps a single copy of the model in memory. Without it the model needs about twice its size in memory: the default model no longer fits in 32 GB, and the system stops the model server when the memory runs out." ;;
-    LLAMA_ARG_CACHE_RAM) echo "serious|the memory limit for remembered conversations (LLM_CACHE_RAM_MIB). Without it they can take up to 8 GB more memory." ;;
+    LLAMA_ARG_CACHE_RAM) echo "serious|the memory limit for remembered conversations (LLM_CACHE_RAM_MIB). Without it they can take up to 8 GB of memory instead." ;;
     LLAMA_ARG_LOAD_MODE) echo "minor|how the model is held in memory (LLM_LOAD_MODE). Without it the system can move parts of the model out of memory, and answers get slower." ;;
     LLAMA_ARG_N_PARALLEL) echo "minor|how many requests the model works on at the same time (LLM_PARALLEL)." ;;
     LLAMA_ARG_THREADS) echo "minor|how many CPU threads write answers (LLM_THREADS). Without it the model server picks its own number, which can use up Hostinger's CPU credits faster." ;;
