@@ -48,6 +48,11 @@ services:
       # so the default 21 GB model would not fit in 32 GB. Repacking off read
       # prompts 1.7x faster on that model and wrote just as fast.
       LLAMA_ARG_REPACK: "false"
+      # The same switch under its old name. Builds b6049 to b7375 (August to
+      # mid-December 2025) know only this name, and only the values 1 and
+      # true. Newer builds read it first and take any value as "off". To turn
+      # repacking back on, remove both lines.
+      LLAMA_ARG_NO_REPACK: "1"
       LLAMA_ARG_CACHE_RAM: ${LLM_CACHE_RAM_MIB:-2048}
       LLAMA_ARG_CTX_CHECKPOINTS: "8"
       LLAMA_ARG_UI: "false"

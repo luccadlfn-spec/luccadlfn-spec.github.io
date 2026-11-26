@@ -124,9 +124,30 @@ def test_model_server_keeps_one_copy_of_the_model_in_ram(compose):
     # buffer while mlock still holds the whole mapped file: 7.6 GB of RAM for
     # a 4.2 GB mixture-of-experts file. The default 21 GB model would then not
     # fit in 32 GB. Both "false" and "0" were checked to switch repacking off.
+    # The old name of the switch is set too: llama.cpp builds b6049 to b7375
+    # read only LLAMA_ARG_NO_REPACK, and only "1" or "true". Later builds read
+    # it first and take any value as "off", so it must never be "0" for "on".
     environment = compose["services"]["llm"]["environment"]
     assert environment["LLAMA_ARG_REPACK"] in ("false", "0")
+    assert environment["LLAMA_ARG_NO_REPACK"] in ("1", "true")
     assert "mmap" in environment["LLAMA_ARG_LOAD_MODE"]
+
+
+def test_installer_reads_the_model_server_settings_as_compose_does(compose):
+    # install.sh and `myai doctor` check that a llama.cpp build knows every
+    # setting of service llm. They read those settings with a small parser of
+    # their own (bin/myai-lib.sh, compose_llm_settings), which must see what
+    # Compose sees: each LLAMA_* variable, and each command-line option.
+    llm = compose["services"]["llm"]
+    script = '. "$1/bin/myai-lib.sh" && compose_llm_settings "$1/docker-compose.yml"'
+    out = subprocess.run(["bash", "-c", script, "bash", str(APP)], capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    names = out.stdout.split()
+    variables = sorted(name for name in names if not name.startswith("-"))
+    assert variables == sorted(key for key in llm["environment"] if key.startswith("LLAMA_"))
+    options = [name for name in names if name.startswith("-")]
+    assert options == [part.split("=")[0] for part in llm["command"] if part.startswith("--")]
+    assert options  # --threads-batch: it has no environment variable
 
 
 def test_agent_gets_the_model_servers_thinking_budget(compose):

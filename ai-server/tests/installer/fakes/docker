@@ -45,8 +45,31 @@ case "${1:-}" in
     svc=${id#id-}
     case "$*" in
       *NetworkSettings*) cat "$D/ip_$svc" 2>/dev/null || echo "172.30.0.2" ;;
+      # "PID OOMKILLED RESTARTS CREATED"; PID 0: not running.
+      *OOMKilled*) cat "$D/facts_$svc" 2>/dev/null || echo "0 false 0 2026-11-26T03:00:00.000000000Z" ;;
       *) next_line "$D/state_$svc" "running healthy 0" ;;
     esac
+    exit 0
+    ;;
+  run)
+    # docker run [options] IMAGE --help: the model server's help text, from
+    # $FAKE_DIR/llama_help_<IMAGE, every character other than a letter or a
+    # digit made "_">, else from $FAKE_DIR/llama_help.
+    image=""
+    prev=""
+    for arg in "$@"; do
+      if [ "$arg" = --help ]; then image=$prev; fi
+      prev=$arg
+    done
+    [ -n "$image" ] || exit 0
+    if [ -f "$D/llama_help_${image//[^A-Za-z0-9]/_}" ]; then
+      cat "$D/llama_help_${image//[^A-Za-z0-9]/_}"
+    elif [ -f "$D/llama_help" ]; then
+      cat "$D/llama_help"
+    else
+      echo "docker: Error response from daemon: No such image: $image" >&2
+      exit 125
+    fi
     exit 0
     ;;
   image)

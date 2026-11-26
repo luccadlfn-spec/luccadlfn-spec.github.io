@@ -943,6 +943,8 @@ STUB
 
 doctor_ready() {
   myai_ready
+  # The model server's settings are read from the real compose file.
+  cp "$AI_DIR/docker-compose.yml" "$APP/docker-compose.yml"
   export MYAI_DOCTOR_SAMPLE_SECS=0
   echo 200 >"$FAKE_DIR/https_code"
   echo "myai-caddy-1" >"$FAKE_DIR/ps_ours_80"
@@ -959,6 +961,7 @@ test_doctor_all_good() {
   assert_contains "$OUT" "[ok]       HTTPS answers with a valid certificate (status 200)."
   assert_contains "$OUT" "[ok]       Service llm: ready."
   assert_contains "$OUT" "[ok]       Model file:"
+  assert_contains "$OUT" "[ok]       The model server knows all the settings that myai gives it."
   assert_contains "$OUT" "[ok]       Memory: 7.6 GB free of 31.3 GB."
   assert_contains "$OUT" "[ok]       Disk:"
   assert_contains "$OUT" "[ok]       CPU: steal 0.0% (normal)"

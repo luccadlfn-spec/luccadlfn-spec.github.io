@@ -35,6 +35,9 @@ sandbox() {
   echo "port 22" >"$FAKE_DIR/sshd_T"
   # The tests behave the same whoever runs them: "id -u" says root.
   echo 0 >"$FAKE_DIR/uid"
+  # What "docker run IMAGE --help" prints for a model server build: the real
+  # help text of llama.cpp's server, master f5e6915c2 (2026-11-23).
+  cp "$TESTS_DIR/llama-server-help.txt" "$FAKE_DIR/llama_help"
   export TMPDIR="$T/tmp"
   mkdir -p "$TMPDIR"
 }

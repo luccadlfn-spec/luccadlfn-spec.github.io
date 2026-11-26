@@ -37,6 +37,9 @@ die() {
   exit 1
 }
 
+# The number of lines in TEXT that are not empty.
+count_lines() { printf '%s\n' "$1" | grep -c .; }
+
 # 21166758016 -> "21.2 GB" (decimal, as download pages show it)
 fmt_gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f GB", b / 1000000000 }'; }
 
@@ -563,6 +566,201 @@ image_digest_ref() {
     fi
   done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null)
   return 1
+}
+
+# -------------------------------------------- the model server's settings ---
+# docker-compose.yml gives the model server (service llm) its settings as
+# LLAMA_* environment variables, plus a few command-line options. A llama.cpp
+# build ignores an environment variable it does not know, without a word, so
+# a setting that a newer build renamed is simply lost. An option it does not
+# know stops it at once instead. Its --help lists every option it knows and,
+# under each, "(env: NAME)" for the variable that sets it.
+
+# compose_llm_settings FILE: the LLAMA_* environment names of service llm,
+# then its command-line options (--name), one per line, in file order.
+compose_llm_settings() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[^[:space:]]/ { top = $0; svc = ""; next }
+    top ~ /^services:/ && /^  [^[:space:]]/ { svc = $1; sub(/:.*$/, "", svc); key = ""; next }
+    svc != "llm" { next }
+    /^    [^[:space:]-]/ { key = $1; sub(/:.*$/, "", key) }
+    key == "environment" && /^      (- )?LLAMA_[A-Z0-9_]+[:=]/ {
+      name = $0
+      sub(/^      (- )?/, "", name)
+      sub(/[:=].*$/, "", name)
+      print name
+    }
+    key == "command" {
+      line = $0
+      while (match(line, /--[a-z][a-z0-9-]*/)) {
+        print substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }' "$1"
+}
+
+# llama_help IMAGE: the --help text of that model server build; nothing when
+# it cannot be run (the image is not on this server, for example) or does not
+# answer within a minute. Nothing is downloaded, the container has no
+# network, and it is removed again.
+llama_help() {
+  local name="myai-llama-help-$$-$RANDOM" out rc=0
+  # When the minute is up, "timeout" tells docker to stop, and docker passes
+  # that on to the container. A program that runs alone in a container does
+  # not get that message unless it is written to; --init puts a small helper
+  # in front of it that hands the message on. If docker still waits 10
+  # seconds later, -k stops docker itself, and the container is removed below.
+  out=$(timeout -k 10 60 docker run --rm --init --pull never --network none --name "$name" "$1" --help 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; fi
+  # Stopped half-way (124, or 137 by force): part of a help text would make
+  # the settings it leaves out look unknown.
+  case "$rc" in
+    124 | 137) ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+# llama_lost_settings IMAGE COMPOSE_FILE: the settings in COMPOSE_FILE that the
+# model server build IMAGE does not know, one per line; nothing when it knows
+# them all. Fails when that cannot be told: no help text with environment
+# names, or no settings found in the file.
+llama_lost_settings() {
+  local settings help envs opts name other
+  settings=$(compose_llm_settings "$2" 2>/dev/null) || settings=""
+  [ -n "$settings" ] || return 1
+  help=$(llama_help "$1")
+  envs=$(printf '%s\n' "$help" | grep -F '(env:' | grep -oE 'LLAMA_[A-Z0-9_]+' | sort -u) || envs=""
+  [ -n "$envs" ] || return 1
+  # Option names, from the lines that introduce an option. A help text in
+  # which no line does so cannot tell which options the build knows.
+  opts=$(printf '%s\n' "$help" | grep -E '^-' | grep -oE -- '--[a-z0-9][a-z0-9-]*' | sort -u) || opts=""
+  for name in $settings; do
+    case "$name" in
+      --*)
+        if [ -n "$opts" ] && ! grep -qxF -- "$name" <<<"$opts"; then printf '%s\n' "$name"; fi
+        continue
+        ;;
+    esac
+    if grep -qxF -- "$name" <<<"$envs"; then continue; fi
+    # The old and the new name of one switch, both in the file (repacking):
+    # a build that lists either one knows the switch. Newer builds still read
+    # the old name without listing it. A lost switch is named once, by its
+    # new name.
+    case "$name" in
+      LLAMA_ARG_NO_*) other=LLAMA_ARG_${name#LLAMA_ARG_NO_} ;;
+      LLAMA_ARG_*) other=LLAMA_ARG_NO_${name#LLAMA_ARG_} ;;
+      *) other="" ;;
+    esac
+    if [ -n "$other" ] && grep -qxF -- "$other" <<<"$settings"; then
+      if grep -qxF -- "$other" <<<"$envs"; then continue; fi
+      case "$name" in
+        LLAMA_ARG_NO_*) continue ;;
+      esac
+    fi
+    printf '%s\n' "$name"
+  done
+}
+
+# llama_setting_meaning NAME: "serious|text" or "minor|text": what a lost
+# setting means for the owner. Serious ones can stop the model server, fill
+# the memory or let others use it.
+llama_setting_meaning() {
+  case "$1" in
+    LLAMA_ARG_MODEL) echo "serious|which model file to load. Without it the model server cannot start." ;;
+    LLAMA_ARG_ALIAS) echo "minor|the name the model is offered under (\"assistant\"). Without it the model is listed under its file name instead." ;;
+    LLAMA_ARG_HOST) echo "serious|that the model server listens on the network inside Docker. Without it the agent cannot reach the model." ;;
+    LLAMA_ARG_PORT) echo "serious|the port where the agent and the health check find the model server (8080). Without it nothing reaches the model." ;;
+    LLAMA_API_KEY) echo "serious|the password between the agent and the model server. Without it the model server answers any program on its network." ;;
+    LLAMA_ARG_CTX_SIZE) echo "serious|how much text the model keeps in mind (LLM_CTX). Without it the model server takes the model's own maximum, which can need many GB more memory." ;;
+    LLAMA_ARG_REPACK | LLAMA_ARG_NO_REPACK) echo "serious|the switch that keeps a single copy of the model in memory. Without it the model needs about twice its size in memory: the default model no longer fits in 32 GB, and the system stops the model server when the memory runs out." ;;
+    LLAMA_ARG_CACHE_RAM) echo "serious|the memory limit for remembered conversations (LLM_CACHE_RAM_MIB). Without it they can take up to 8 GB more memory." ;;
+    LLAMA_ARG_LOAD_MODE) echo "minor|how the model is held in memory (LLM_LOAD_MODE). Without it the system can move parts of the model out of memory, and answers get slower." ;;
+    LLAMA_ARG_N_PARALLEL) echo "minor|how many requests the model works on at the same time (LLM_PARALLEL)." ;;
+    LLAMA_ARG_THREADS) echo "minor|how many CPU threads write answers (LLM_THREADS). Without it the model server picks its own number, which can use up Hostinger's CPU credits faster." ;;
+    LLAMA_ARG_CTX_CHECKPOINTS) echo "minor|how many snapshots of a conversation are kept (8). Without it more are kept, which takes more memory." ;;
+    LLAMA_ARG_UI) echo "minor|that the model server's own chat page is off. Nothing outside Docker can reach that page, so this one does no harm." ;;
+    LLAMA_ARG_REASONING) echo "minor|that each request can turn thinking on or off. Without it the model may think when it should not, or the other way round." ;;
+    LLAMA_ARG_THINK_BUDGET) echo "minor|the limit on thinking (LLM_THINK_BUDGET). Without it the model can think for a very long time before it answers." ;;
+    LLAMA_ARG_N_PREDICT) echo "minor|the longest answer when a program sets no limit. Without it an answer can go on for a very long time." ;;
+    LLAMA_ARG_TEMPERATURE | LLAMA_ARG_TOP_P | LLAMA_ARG_TOP_K | LLAMA_ARG_MIN_P | LLAMA_ARG_PRESENCE_PENALTY)
+      echo "minor|how the model picks its words (LLM_${1#LLAMA_ARG_}). Without it the model server uses its own default, and answers can wander or repeat themselves."
+      ;;
+    LLAMA_ARG_TIMEOUT) echo "minor|how long one request may take (an hour). Without it long answers can be cut off." ;;
+    --threads-batch) echo "serious|how many CPU threads read prompts (LLM_THREADS_BATCH)." ;;
+    --*) echo "serious|an option of the model server." ;;
+    *) echo "minor|a setting from docker-compose.yml. The model server uses its own default instead." ;;
+  esac
+}
+
+# ---------------------------------------------- the model server's memory ---
+
+# llm_facts: what Docker knows about the model server's container, in
+# LLM_PID (0 when it does not run), LLM_OOM ("true" when the kernel stopped
+# it the last time for lack of memory; Docker forgets that once it runs
+# again), LLM_RESTARTS and LLM_SINCE (when the container was made, in seconds
+# since 1970). Fails when there is no container.
+llm_facts() {
+  local id out created=""
+  LLM_PID=0
+  LLM_OOM=false
+  LLM_RESTARTS=0
+  LLM_SINCE=""
+  id=$(dc ps -aq llm 2>/dev/null | awk 'NR == 1') || id=""
+  [ -n "$id" ] || return 1
+  out=$(docker inspect --format '{{.State.Pid}} {{.State.OOMKilled}} {{.RestartCount}} {{.Created}}' \
+    "$id" 2>/dev/null) || return 1
+  read -r LLM_PID LLM_OOM LLM_RESTARTS created <<<"$out" || true
+  [[ $LLM_PID =~ ^[0-9]+$ ]] || LLM_PID=0
+  [[ $LLM_RESTARTS =~ ^[0-9]+$ ]] || LLM_RESTARTS=0
+  if [ -n "$created" ]; then LLM_SINCE=$(date -d "$created" +%s 2>/dev/null) || LLM_SINCE=""; fi
+}
+
+# llm_oom_kills: how often the kernel stopped the model server because the
+# memory ran out, since its container was made. The kernel log names the
+# program it stopped ("Killed process 1234 (llama-server)"); the container's
+# own memory counters are gone once it has stopped. The log of every boot
+# since then counts (not --dmesg, which reads only this boot): when the chat
+# stops answering, a restart of the server is a likely next step, and the
+# container survives it. Needs llm_facts.
+llm_oom_kills() {
+  local kills=0
+  if [ -n "$LLM_SINCE" ] && command -v journalctl >/dev/null 2>&1; then
+    kills=$(journalctl -q --no-pager -o cat _TRANSPORT=kernel --since "@$LLM_SINCE" 2>/dev/null |
+      grep -oE 'Killed process [0-9]+ \(llama-server\)' | sort -u | wc -l) || kills=0
+  fi
+  [[ $kills =~ ^[0-9]+$ ]] || kills=0
+  if [ "$kills" -eq 0 ] && [ "$LLM_OOM" = true ]; then kills=1; fi
+  printf '%s\n' "$kills"
+}
+
+# llm_memory_kb: "OWN FILE SWAP": the model server's memory in kB, from
+# /proc. OWN is memory of its own, in RAM or moved to swap; FILE is files it
+# maps, the model above all; SWAP is the part of OWN in swap. The default
+# load mode locks the model file in RAM, so when a second copy does not fit
+# beside it, the system moves part of that copy to swap. Fails when it cannot
+# be read. Needs llm_facts.
+llm_memory_kb() {
+  [ "$LLM_PID" -gt 0 ] || return 1
+  awk '$1 == "RssAnon:" { a = $2 } $1 == "RssFile:" { f = $2 } $1 == "VmSwap:" { s = $2 }
+    END { if (a == "" || f == "") exit 1; print a + s, f, s + 0 }' "$MYAI_SYSROOT/proc/$LLM_PID/status" 2>/dev/null
+}
+
+# model_held_twice OWN_KB FILE_KB MODEL_BYTES CTX CACHE_MIB: true when the
+# model server's memory can only be explained by a second copy of the model,
+# which llama.cpp makes when weight repacking is on. Besides one copy of the
+# model it may use: the prompt cache (CACHE_MIB), 150 KB per token of context
+# (the "classic" model needs 98 KB, the others less), and 512 MB plus 30% of
+# the model for working buffers and the snapshots of long conversations.
+# Measured with repacking on, the copy was 80% of a 4.2 GB mixture-of-experts
+# file (72% in the CPU_REPACK buffers that CPUs without AMX use) and the whole
+# of a 2.5 GB dense one.
+model_held_twice() {
+  awk -v a="$1" -v f="$2" -v m="$3" -v ctx="$4" -v cache="$5" 'BEGIN {
+    extra = (a + f) * 1024 - m
+    allowed = cache * 1048576 + ctx * 150000 + 512 * 1048576 + 0.3 * m
+    exit !(extra > allowed)
+  }'
 }
 
 # ------------------------------------------------- talking to the gateway ---

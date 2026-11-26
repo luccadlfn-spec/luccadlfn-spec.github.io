@@ -1007,6 +1007,94 @@ doctor_model() {
   fi
 }
 
+# Does the model server build know every setting that docker-compose.yml
+# gives it? It ignores an environment variable it does not know without a
+# word, and stops at once on an option it does not know.
+doctor_llm_settings() {
+  local image lost vars opts name meaning serious=0 lines=()
+  image=$(env_get LLAMA_IMAGE) || image=""
+  image=${image:-ghcr.io/ggml-org/llama.cpp:server}
+  if ! lost=$(llama_lost_settings "$image" "$APP_DIR/docker-compose.yml"); then
+    doc_look "Could not check which settings the model server knows: its program could not say." \
+      "If the chat works, nothing needs to be done. Otherwise look at: myai logs llm"
+    return 0
+  fi
+  if [ -z "$lost" ]; then
+    doc_ok "The model server knows all the settings that myai gives it."
+    return 0
+  fi
+  vars=$(grep -v -- '^--' <<<"$lost") || vars=""
+  opts=$(grep -- '^--' <<<"$lost") || opts=""
+  if [ -n "$opts" ]; then
+    for name in $opts; do
+      meaning=$(llama_setting_meaning "$name")
+      lines+=("- $name: ${meaning#*|}")
+    done
+    doc_bad "This build of the model server does not know $(count_lines "$opts") of the options that myai gives it, so it cannot start:" \
+      "${lines[@]}" "A newer myai may know the new names: myai update"
+  fi
+  [ -n "$vars" ] || return 0
+  lines=()
+  for name in $vars; do
+    meaning=$(llama_setting_meaning "$name")
+    if [ "${meaning%%|*}" = serious ]; then serious=1; fi
+    lines+=("- $name: ${meaning#*|}")
+  done
+  lines+=("This build of the model server (llama.cpp) knows these settings under other names, or not at all."
+    "A newer myai may know the new names: myai update")
+  if [ "$serious" = 1 ]; then
+    doc_bad "The model server ignores $(count_lines "$vars") of the settings that myai gives it:" "${lines[@]}"
+  else
+    doc_look "The model server ignores $(count_lines "$vars") of the settings that myai gives it:" "${lines[@]}"
+  fi
+}
+
+# Out-of-memory stops of the model server, and whether it holds the model
+# twice. Says nothing while it loads, when it is stopped, or when the numbers
+# cannot be read.
+doctor_llm_memory() {
+  local kills kb own file swap size ctx cache used in_swap="" id advice=()
+  if stack_is_stopped || ! llm_facts; then return 0; fi
+  kills=$(llm_oom_kills)
+  if [ "$kills" -gt 0 ]; then
+    advice=("The model needs more memory than this server has free. What helps:")
+    id=$(env_get MODEL_ID) || id=""
+    case "$id" in
+      fast) ;;
+      classic) advice+=("- a smaller model: myai model use fast   (much weaker)") ;;
+      hauhau | heretic | huihui) advice+=("- a smaller model: myai model use classic   (or the much weaker: myai model use fast)") ;;
+      *) advice+=("- a smaller model: myai model list") ;;
+    esac
+    advice+=("- less memory for conversations: in $ENV_FILE set LLM_CTX=16384, AGENT_CTX_TOKENS=6000"
+      "  and LLM_CACHE_RAM_MIB=512 (the values for small servers), then run: myai restart"
+      "- if a line above says that the model server ignores the switch that keeps a single copy"
+      "  of the model in memory, that is the cause: myai update")
+    doc_bad "The system stopped the model server $kills time(s) because the memory ran out." "${advice[@]}"
+  elif [ "$LLM_RESTARTS" -gt 0 ] && svc_is_up llm; then
+    doc_look "The model server has restarted $LLM_RESTARTS time(s) since it was set up." \
+      "If the chat stops answering now and then, its messages say why: myai logs llm"
+  fi
+  [ "$(svc_state llm)" = healthy ] || return 0
+  kb=$(llm_memory_kb) || return 0
+  read -r own file swap <<<"$kb"
+  size=$(file_size "$(model_path)") || return 0
+  ctx=$(env_get LLM_CTX) || ctx=32768
+  cache=$(env_get LLM_CACHE_RAM_MIB) || cache=2048
+  # A context or prompt cache without a set size (0 or -1): no limit to compare with.
+  if [[ ! $ctx =~ ^[1-9][0-9]*$ ]] || [[ ! $cache =~ ^[0-9]+$ ]]; then return 0; fi
+  used=$(((own + file) * 1024))
+  # Named from 0.1 GB on: a few MB in swap are common and say nothing.
+  if [ "$swap" -ge 100000 ]; then in_swap=" ($(fmt_gb $((swap * 1024))) of it in swap)"; fi
+  if model_held_twice "$own" "$file" "$size" "$ctx" "$cache"; then
+    doc_bad "The model server uses $(fmt_gb "$used") of memory$in_swap for a $(fmt_gb "$size") model file: it holds a second copy of the model." \
+      "llama.cpp makes that copy (\"repacking\") when it ignores the switch that myai sets." \
+      "A newer myai may fix it: myai update" \
+      "Until then a smaller model needs less memory: myai model list"
+  else
+    doc_ok "Model server memory: $(fmt_gb "$used")$in_swap for a $(fmt_gb "$size") model file."
+  fi
+}
+
 doctor_memory() {
   local total avail swap_total swap_free
   read -r total avail swap_total swap_free < <(awk '
@@ -1098,6 +1186,8 @@ cmd_doctor() {
   doctor_https
   doctor_services
   doctor_model
+  doctor_llm_settings
+  doctor_llm_memory
   doctor_memory
   doctor_disk
   doctor_cpu

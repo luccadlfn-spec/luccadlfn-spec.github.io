@@ -176,7 +176,7 @@ Run these on the server as root:
 | Command | What it does |
 |---|---|
 | `myai status` | Is everything running? |
-| `myai doctor` | Checks address, certificate, memory and disk, with advice |
+| `myai doctor` | Checks address, certificate, model server, memory and disk, with advice |
 | `myai link` / `myai creds` | Your entry link (with QR code) / all logins |
 | `myai logs [service]` | Recent messages (`llm`, `agent`, `sandbox`, `webui`, `searxng`, `caddy`) |
 | `myai start` / `stop` / `restart` | Start, stop or restart everything |
@@ -293,6 +293,18 @@ model may only read files. See the script's header for details.
 - **Very slow, or the dashboard says "throttled":** the CPU credits are low.
   Give the server some quiet time. See
   [Speed and CPU credits](#speed-and-cpu-credits).
+- **The chat stops answering, or the model server keeps restarting:** run
+  `myai doctor`. It says whether the server ran out of memory, and whether
+  the model server keeps a second copy of the model in memory. When the
+  memory runs out:
+  - use a smaller model: `myai model use classic`, or the much weaker
+    `myai model use fast`;
+  - or give the conversations less memory: in `/opt/myai/.env` set
+    `LLM_CTX=16384`, `AGENT_CTX_TOKENS=6000` and `LLM_CACHE_RAM_MIB=512`,
+    then run `myai restart`.
+
+  If `myai doctor` says that the model server ignores some of its settings,
+  run `myai update`: a newer myai may know their new names.
 - **Something is stuck:** run `myai restart`. Your data is kept.
 
 ## What has been tested
@@ -303,8 +315,8 @@ Hostinger server:
 | Suite | Result |
 |---|---|
 | Agent unit tests | 372 passed |
-| Sandbox tests | 105 passed, 1 skipped |
-| Installer tests (shellcheck clean) | 269 passed |
+| Sandbox tests | 106 passed, 1 skipped |
+| Installer tests (shellcheck clean) | 299 passed |
 
 **Whole stack:** all six services ran together and were checked end to end:
 

@@ -1489,8 +1489,91 @@ pick_llama_build() {
   fi
 }
 
+# Lost settings (see llama_lost_settings) with what each one means, under a
+# warning.
+show_lost_settings() { # LIST
+  local name meaning
+  for name in $1; do
+    meaning=$(llama_setting_meaning "$name")
+    printf '      - %s: %s\n' "$name" "${meaning#*|}" >&2
+  done
+}
+
+# Does the model server build that is about to start know every setting that
+# docker-compose.yml gives it? It ignores an environment variable it does not
+# know without a word, and stops at once on an option it does not know.
+# During an update, a newer build that would lose a serious setting which the
+# current build knows (one that can stop the model server, fill the memory or
+# let others use it) is not tried at all, so it is never recorded: the model
+# loading would not show such a loss, and the current build works. A newer
+# build that loses only smaller settings is tried, with the list below.
+check_llama_build() {
+  local current=${PLAN[LLAMA_IMAGE]} compose="$APP_DIR/docker-compose.yml" lost before="" known=1 name regress=""
+  local build="The model server build" vars opts meaning lines=()
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would check that the model server build knows every setting in docker-compose.yml"
+    return 0
+  fi
+  if ! lost=$(llama_lost_settings "${LLAMA_TRY:-$current}" "$compose"); then
+    note "Skipped one check: the model server program could not say which settings it knows."
+    return 0
+  fi
+  if [ -n "$lost" ] && [ -n "$LLAMA_TRY" ] && [[ $current == *@sha256:* ]]; then
+    before=$(llama_lost_settings "$current" "$compose") || known=0
+    for name in $lost; do
+      if grep -qxF -- "$name" <<<"$before"; then continue; fi
+      case "$(llama_setting_meaning "$name")" in
+        serious\|*) regress+="$name"$'\n' ;;
+      esac
+    done
+    if [ -n "$regress" ]; then
+      vars=$(grep -v -- '^--' <<<"$regress") || vars=""
+      opts=$(grep -- '^--' <<<"$regress") || opts=""
+      if [ -n "$vars" ]; then
+        warn "The newest build of the model server does not know $(count_lines "$vars") of the settings that myai gives it, and would ignore them:"
+        show_lost_settings "$vars"
+      fi
+      if [ -n "$opts" ]; then
+        warn "The newest build of the model server does not know $(count_lines "$opts") of the options that myai gives it, so it would not start:"
+        show_lost_settings "$opts"
+      fi
+      warn "So the model server stays on the build that works. The next \"myai update\" tries the newest build again."
+      # Unused, so it does not stay on the disk: its exact name and the moving
+      # tag, which names it now. The next update downloads the newest again.
+      docker image rm "$LLAMA_TRY" "$LLAMA_UPDATE_TAG" >/dev/null 2>&1 || true
+      LLAMA_TRY=""
+      [ "$known" = 1 ] || return 0
+      lost=$before
+      build="The current build"
+    fi
+  fi
+  vars=$(grep -v -- '^--' <<<"$lost") || vars=""
+  opts=$(grep -- '^--' <<<"$lost") || opts=""
+  # With an option it does not know, the model server stops at once.
+  if [ -n "$opts" ]; then
+    for name in $opts; do
+      meaning=$(llama_setting_meaning "$name")
+      lines+=("- $name: ${meaning#*|}")
+    done
+    die "This build of the model server does not know $(count_lines "$opts") of the options that myai gives it, so it cannot start:" \
+      "${lines[@]}" "A newer myai may know the new names: myai update" \
+      "If this message comes back after that, report it."
+  fi
+  if [ -z "$vars" ]; then
+    note "$build knows all the settings that myai gives it."
+    return 0
+  fi
+  warn "$build does not know $(count_lines "$vars") of the settings that myai gives it. It ignores them without a message:"
+  show_lost_settings "$vars"
+  warn "myai goes on with this build. To see this list again: myai doctor. A newer myai may fix it: myai update"
+}
+
 llm_failure_help() { # RC
-  if [ "$1" -eq 1 ]; then
+  local kills=0
+  if llm_facts; then kills=$(llm_oom_kills); fi
+  if [ "$kills" -gt 0 ]; then
+    printf 'The model server ran out of memory: the system stopped it %s time(s).\n' "$kills"
+  elif [ "$1" -eq 1 ]; then
     printf 'The model server was not ready after 30 minutes.\n'
   else
     printf 'The model server stopped or keeps restarting.\n'
@@ -1561,6 +1644,7 @@ start_stack() {
   run_dc pull --ignore-buildable || die "The container images could not be downloaded." \
     "This is usually a short network problem. Run the same command again."
   pick_llama_build
+  check_llama_build
   note "Building the agent and the sandbox."
   run_dc build agent sandbox || die "Building the agent or the sandbox failed." \
     "The messages above show where. Run the same command again; if it fails the same way, report those messages."
@@ -1590,6 +1674,7 @@ self_test() {
   if [ "$DRY_RUN" = 1 ]; then
     note "would send one short chat request through the agent gateway and report tokens per second"
     note "would give the agent one small task that must use a tool (write a file) and check the result"
+    note "would check that the model server did not run out of memory and holds the model only once"
     return 0
   fi
   if [ "$STACK_STARTED" != 1 ]; then
@@ -1635,9 +1720,33 @@ self_test() {
     esac
   fi
 
+  selftest_memory
   if [ "$SELFTEST_FAILED" = 1 ]; then
     warn "A test failed. The installation is complete and stays as it is."
     warn "Look for the cause with: myai doctor   and: myai logs agent"
+  fi
+}
+
+# After the tests: did the system stop the model server because the memory
+# ran out, and does it hold a second copy of the model? One line each; myai
+# doctor explains more.
+selftest_memory() {
+  local kills kb own file size
+  llm_facts || return 0
+  kills=$(llm_oom_kills)
+  if [ "$kills" -gt 0 ]; then
+    SELFTEST_FAILED=1
+    warn "The system stopped the model server $kills time(s) because the memory ran out. What to do: myai doctor"
+  fi
+  [ "$(svc_state llm)" = healthy ] || return 0
+  kb=$(llm_memory_kb) || return 0
+  read -r own file _ <<<"$kb"
+  size=$(file_size "${PLAN[DATA_DIR]}/models/${PLAN[MODEL_FILE]}") || return 0
+  # A context or prompt cache without a set size (0 or -1): no limit to compare with.
+  if [[ ! ${PLAN[LLM_CTX]:-} =~ ^[1-9][0-9]*$ ]] || [[ ! ${PLAN[LLM_CACHE_RAM_MIB]:-} =~ ^[0-9]+$ ]]; then return 0; fi
+  if model_held_twice "$own" "$file" "$size" "${PLAN[LLM_CTX]}" "${PLAN[LLM_CACHE_RAM_MIB]}"; then
+    SELFTEST_FAILED=1
+    warn "The model server holds a second copy of the model in memory, so it can run out of memory later. What to do: myai doctor"
   fi
 }
 
@@ -1812,7 +1921,7 @@ final_summary() {
 
 Three commands to know:
   myai status    is everything running?
-  myai doctor    checks the address, certificate, memory and disk, with advice
+  myai doctor    checks the address, certificate, model server, memory and disk, with advice
   myai bench     finds the best number of threads (the chat pauses for 10 to 15 minutes)
 
 All of the above is saved in /root/myai-credentials.txt (only root can read it).

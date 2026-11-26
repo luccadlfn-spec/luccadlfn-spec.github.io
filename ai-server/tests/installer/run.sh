@@ -60,7 +60,7 @@ SYSPATH=""
 mkdir -p "$SYSBIN"
 for tool in bash sh awk sed grep cat head tail tr cut sort uniq wc stat mktemp mkdir rmdir rm cp mv chmod \
   chown ln ls dirname basename readlink date sleep env paste od sha256sum jq python3 flock touch tee find \
-  cmp diff pgrep gzip nproc true false; do
+  cmp diff pgrep gzip nproc timeout true false; do
   mapfile -t found < <(type -aP "$tool" 2>/dev/null)
   [ ${#found[@]} -gt 0 ] || continue
   dir=$(dirname "${found[0]}")
