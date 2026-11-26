@@ -10,6 +10,7 @@ backup_files() { find "$APP/backups" -maxdepth 1 -name 'myai-*.tar.gz' | sort; }
 myai_ready() {
   fake_install
   load_myai
+  # shellcheck disable=SC2329  # replaces the library's have_tty, which confirm() calls
   have_tty() { return 1; }
 }
 
@@ -58,6 +59,7 @@ test_backup_trap_restarts_services_after_a_failed_archive() {
 test_backup_trap_restarts_services_when_the_command_dies() {
   myai_ready
   # Something goes wrong in the middle that nobody planned for.
+  # shellcheck disable=SC2329  # replaces the function of bin/myai that make_backup calls
   backup_archive() {
     printf 'half' >"$1"
     exit 3
@@ -130,8 +132,7 @@ test_restore_brings_back_settings_and_data() {
   env_set LLM_THREADS 2
   sleep 1 # a different second, so the safety backup gets its own name
   : >"$FAKE_LOG"
-  ASSUME_YES=1
-  expect_ok cmd_restore "$archive"
+  ASSUME_YES=1 expect_ok cmd_restore "$archive"
   assert_eq "$(cat "$APP/data/webui/webui.db")" "chat database"
   assert_eq "$(cat "$APP/data/workspace/notes.txt")" "a file"
   assert_no_file "$APP/data/workspace/newer.txt"
@@ -153,8 +154,7 @@ test_restore_accepts_a_bare_file_name() {
   archive=$(basename "$(backup_files)")
   echo "changed" >"$APP/data/webui/webui.db"
   sleep 1
-  ASSUME_YES=1
-  expect_ok cmd_restore "$archive"
+  ASSUME_YES=1 expect_ok cmd_restore "$archive"
   assert_eq "$(cat "$APP/data/webui/webui.db")" "chat database"
 }
 
@@ -174,22 +174,22 @@ test_restore_asks_first_and_changes_nothing_without_a_yes() {
 
 test_restore_refuses_archives_it_did_not_make() {
   myai_ready
-  ASSUME_YES=1
   mkdir -p "$T/evil/etc" "$T/evil/data"
   echo x >"$T/evil/etc/passwd"
   echo x >"$T/evil/.env"
+  # Each try answers yes, so what refuses it is the check of the archive.
   "$REAL_TAR" -czf "$T/foreign.tar.gz" -C "$T/evil" .env etc/passwd
-  expect_fail cmd_restore "$T/foreign.tar.gz"
+  ASSUME_YES=1 expect_fail cmd_restore "$T/foreign.tar.gz"
   assert_contains "$OUT" "was not made by \"myai backup\""
   "$REAL_TAR" -czf "$T/noenv.tar.gz" -C "$T/evil" data
-  expect_fail cmd_restore "$T/noenv.tar.gz"
+  ASSUME_YES=1 expect_fail cmd_restore "$T/noenv.tar.gz"
   assert_contains "$OUT" "was not made by"
   echo "this is not an archive" >"$T/junk.tar.gz"
-  expect_fail cmd_restore "$T/junk.tar.gz"
+  ASSUME_YES=1 expect_fail cmd_restore "$T/junk.tar.gz"
   assert_contains "$OUT" "cannot be read as a backup"
-  expect_fail cmd_restore "$T/missing.tar.gz"
+  ASSUME_YES=1 expect_fail cmd_restore "$T/missing.tar.gz"
   assert_contains "$OUT" "There is no file"
-  expect_fail cmd_restore
+  ASSUME_YES=1 expect_fail cmd_restore
   assert_contains "$OUT" "Which backup?"
   assert_eq "$(cat "$APP/data/webui/webui.db")" "chat database" "nothing was touched"
   assert_not_called "down"
@@ -203,10 +203,125 @@ test_restore_without_the_model_file_does_not_start_the_services() {
   rm "$APP/data/models/"*.gguf
   sleep 1
   : >"$FAKE_LOG"
-  ASSUME_YES=1
-  expect_ok cmd_restore "$archive"
+  ASSUME_YES=1 expect_ok cmd_restore "$archive"
   assert_contains "$OUT" "uses a model file that is not on this server"
   assert_not_called "up -d --remove-orphans"
+}
+
+staging_folders() { find "$APP/data" -maxdepth 1 -name '.restore.*' | wc -l; }
+
+test_restore_of_the_oldest_of_seven_backups_keeps_that_backup() {
+  local first i
+  myai_ready
+  expect_ok cmd_backup
+  # A week of nightly backups; the owner goes back as far as possible.
+  first="$APP/backups/myai-20261101-031500.tar.gz"
+  mv "$(backup_files)" "$first"
+  for i in 2 3 4 5 6 7; do cp "$first" "$APP/backups/myai-2026110$i-031500.tar.gz"; done
+  echo "changed chats" >"$APP/data/webui/webui.db"
+  : >"$FAKE_LOG"
+  ASSUME_YES=1 expect_ok cmd_restore "$first"
+  assert_file "$first"
+  assert_eq "$(backup_files | wc -l)" 8 "archives: a restore deletes none, it adds the safety copy"
+  assert_eq "$(cat "$APP/data/webui/webui.db")" "chat database"
+  assert_eq "$(cat "$APP/data/agent/agent.db")" "agent database"
+  assert_eq "$(cat "$APP/data/workspace/notes.txt")" "a file"
+  assert_call_order "down --remove-orphans" "up -d --remove-orphans"
+  assert_eq "$(staging_folders)" 0 "staging folders left behind"
+  # The next backup keeps the newest seven again.
+  expect_ok cmd_backup
+  assert_eq "$(backup_files | wc -l)" 7 "archives after the next backup"
+}
+
+test_restore_that_cannot_be_unpacked_changes_nothing() {
+  local archive
+  myai_ready
+  expect_ok cmd_backup
+  archive=$(backup_files)
+  echo "changed chats" >"$APP/data/webui/webui.db"
+  cp -p "$APP/.env" "$T/env.before"
+  : >"$FAKE_DIR/tar_x_fail" # the disk fills up while unpacking
+  : >"$FAKE_LOG"
+  ASSUME_YES=1 expect_fail cmd_restore "$archive"
+  assert_contains "$OUT" "The backup could not be unpacked."
+  assert_contains "$OUT" "Nothing was changed"
+  assert_eq "$(cat "$APP/data/webui/webui.db")" "changed chats"
+  assert_eq "$(cat "$APP/data/agent/agent.db")" "agent database"
+  cmp -s "$T/env.before" "$APP/.env" || fail "the settings file changed"
+  assert_not_called "down"
+  assert_not_called "stop"
+  assert_file "$archive"
+  assert_eq "$(staging_folders)" 0 "staging folders left behind"
+}
+
+test_restore_puts_everything_back_when_a_folder_cannot_be_replaced() {
+  local archive
+  myai_ready
+  expect_ok cmd_backup
+  archive=$(backup_files)
+  echo "changed chats" >"$APP/data/webui/webui.db"
+  echo "newer agent data" >"$APP/data/agent/agent.db"
+  echo "newer file" >"$APP/data/workspace/newer.txt"
+  env_set LLM_THREADS 2
+  : >"$FAKE_LOG"
+  # The workspace of the backup cannot be moved in (a folder mounted there,
+  # for example), after the chats and the agent data were already exchanged.
+  # shellcheck disable=SC2329  # replaces mv for cmd_restore
+  mv() {
+    case "$*" in
+      *"/.restore."*"/data/workspace "*)
+        echo "mv: cannot move: Device or resource busy" >&2
+        return 1
+        ;;
+    esac
+    command mv "$@"
+  }
+  ASSUME_YES=1 expect_fail cmd_restore "$archive"
+  assert_contains "$OUT" "could not put the files of the backup in place"
+  assert_contains "$OUT" "The state from before is put back"
+  assert_eq "$(cat "$APP/data/webui/webui.db")" "changed chats" "the chats"
+  assert_eq "$(cat "$APP/data/agent/agent.db")" "newer agent data" "the agent data"
+  assert_eq "$(cat "$APP/data/workspace/newer.txt")" "newer file" "the workspace"
+  assert_eq "$(env_get LLM_THREADS)" 2 "the settings"
+  assert_call_order "down --remove-orphans" "up -d --remove-orphans"
+  assert_eq "$(staging_folders)" 0 "staging folders left behind"
+}
+
+test_restore_gives_the_data_folders_their_owners() {
+  myai_ready
+  # A backup without a workspace, whose agent folder has another mode.
+  mkdir -p "$T/b/data/webui" "$T/b/data/agent"
+  echo "old chats" >"$T/b/data/webui/webui.db"
+  echo "old agent data" >"$T/b/data/agent/agent.db"
+  chmod 755 "$T/b/data/agent"
+  cp -p "$APP/.env" "$T/b/.env"
+  "$REAL_TAR" -czf "$T/old.tar.gz" -C "$T/b" .env data
+  : >"$FAKE_LOG"
+  ASSUME_YES=1 expect_ok cmd_restore "$T/old.tar.gz"
+  assert_eq "$(cat "$APP/data/agent/agent.db")" "old agent data"
+  assert_mode "$APP/data/agent" 750
+  [ -d "$APP/data/workspace" ] || fail "no workspace folder after the restore"
+  assert_mode "$APP/data/workspace" 750
+  assert_no_file "$APP/data/workspace/notes.txt"
+  assert_called "install -d -m 750 -o 10001 -g 10001 $APP/data/agent $APP/data/workspace"
+  assert_call_order "install -d -m 750 -o 10001" "up -d --remove-orphans"
+  if [ "$("$REAL_ID" -u)" -eq 0 ]; then
+    assert_eq "$(stat -c %u:%g "$APP/data/agent")" "10001:10001" "owner of the agent data"
+    assert_eq "$(stat -c %u:%g "$APP/data/workspace")" "10001:10001" "owner of the workspace"
+  fi
+}
+
+test_backup_never_writes_over_an_archive() {
+  myai_ready
+  echo "an older backup" >"$APP/backups/myai-20261126-031500.tar.gz"
+  # The clock shows the second of that backup until the new one waited.
+  # shellcheck disable=SC2329  # replaces date and sleep for make_backup
+  date() { if [ -e "$T/slept" ]; then echo 20261126-031501; else echo 20261126-031500; fi; }
+  # shellcheck disable=SC2329
+  sleep() { : >"$T/slept"; }
+  expect_ok cmd_backup
+  assert_eq "$(cat "$APP/backups/myai-20261126-031500.tar.gz")" "an older backup"
+  assert_file "$APP/backups/myai-20261126-031501.tar.gz"
 }
 
 # ------------------------------------------------------------------- bench ---
@@ -239,8 +354,7 @@ bench_speeds() { # speed for 4, 5, 6, 7 and 8 threads
 test_bench_measures_each_thread_count_and_keeps_the_pick() {
   myai_ready
   bench_speeds 5.0 5.6 6.0 6.1 6.2
-  ASSUME_YES=1
-  expect_ok cmd_bench
+  ASSUME_YES=1 expect_ok cmd_bench
   assert_eq "$(env_get LLM_THREADS)" 5 "the thread count that was kept"
   assert_eq "$(env_get LLM_THREADS_BATCH)" 8 "the batch threads are not touched"
   assert_contains "$OUT" "      4   5.0 tokens per second"
@@ -257,8 +371,7 @@ test_bench_range_starts_lower_on_small_servers() {
   fake_machine 2 8000000
   echo 2.0 >"$FAKE_DIR/bench_1"
   echo 3.5 >"$FAKE_DIR/bench_2"
-  ASSUME_YES=1
-  expect_ok cmd_bench
+  ASSUME_YES=1 expect_ok cmd_bench
   assert_eq "$(env_get LLM_THREADS)" 2
   assert_contains "$OUT" "with 1 to 2 threads"
 }
@@ -268,12 +381,12 @@ test_bench_skips_a_failed_measurement() {
   bench_speeds 5.0 5.6 6.0 6.1 6.2
   # With 5 threads the gateway does not answer.
   eval "real_$(declare -f bench_measure)"
+  # shellcheck disable=SC2329  # replaces the function of bin/myai that cmd_bench calls
   bench_measure() {
     if [ "$(env_get LLM_THREADS)" = 5 ]; then return 1; fi
     real_bench_measure
   }
-  ASSUME_YES=1
-  expect_ok cmd_bench
+  ASSUME_YES=1 expect_ok cmd_bench
   assert_contains "$OUT" "      5   failed"
   assert_eq "$(env_get LLM_THREADS)" 6 "5 failed, so 6 (6.0, within 10% of 6.2) is the pick"
 }
@@ -281,8 +394,7 @@ test_bench_skips_a_failed_measurement() {
 test_bench_puts_the_old_value_back_when_nothing_works() {
   myai_ready
   echo "error HTTP 502 no model" >"$FAKE_DIR/chat_reply"
-  ASSUME_YES=1
-  expect_fail cmd_bench
+  ASSUME_YES=1 expect_fail cmd_bench
   assert_contains "$OUT" "No measurement worked"
   assert_contains "$OUT" "Putting back 6 threads"
   assert_eq "$(env_get LLM_THREADS)" 6
@@ -291,9 +403,10 @@ test_bench_puts_the_old_value_back_when_nothing_works() {
 
 test_bench_puts_the_old_value_back_when_interrupted() {
   myai_ready
-  bench_measure() { exit 130; } # Ctrl+C in the middle of the first measurement
-  ASSUME_YES=1
-  expect_fail cmd_bench
+  # Ctrl+C in the middle of the first measurement.
+  # shellcheck disable=SC2329  # replaces the function of bin/myai that cmd_bench calls
+  bench_measure() { exit 130; }
+  ASSUME_YES=1 expect_fail cmd_bench
   assert_eq "$(env_get LLM_THREADS)" 6
 }
 
@@ -304,13 +417,12 @@ test_bench_needs_a_running_model_and_a_yes() {
   assert_contains "$OUT" "Nothing was changed"
   assert_contains "$OUT" "myai bench --yes"
   assert_eq "$(env_get LLM_THREADS)" 6
-  ASSUME_YES=1
   echo "running starting 0" >"$FAKE_DIR/state_llm"
-  expect_fail cmd_bench
+  ASSUME_YES=1 expect_fail cmd_bench
   assert_contains "$OUT" "The model must be running"
   rm "$FAKE_DIR/state_llm"
   : >"$APP/.stopped"
-  expect_fail cmd_bench
+  ASSUME_YES=1 expect_fail cmd_bench
   assert_contains "$OUT" "The model must be running"
   assert_not_called "up -d"
 }
@@ -375,12 +487,26 @@ test_model_use_downloads_first_when_needed() {
   myai_ready
   hf_site
   MODELS_CONF="$T/models.conf"
+  # shellcheck disable=SC2153  # REPO, FILE and SIZE describe the file that hf_site serves (t_download.sh)
   echo "tiny|1|$REPO|$FILE|$SIZE|A tiny test model" >"$MODELS_CONF"
   expect_ok cmd_model use tiny
   cmp -s "$(served_file)" "$APP/data/models/$FILE" || fail "the model file was not downloaded"
   assert_eq "$(env_get MODEL_ID)" tiny
   assert_eq "$(env_get MODEL_FILE)" "$FILE"
   assert_contains "$OUT" "Checksum correct"
+}
+
+test_model_use_stops_when_the_publisher_replaced_the_file() {
+  myai_ready
+  hf_site
+  MODELS_CONF="$T/models.conf"
+  echo "tiny|1|$REPO|$FILE|$((SIZE + 7))|A tiny test model" >"$MODELS_CONF"
+  expect_fail cmd_model use tiny
+  assert_contains "$OUT" "The publisher has replaced the model file $FILE"
+  assert_contains "$OUT" "myai model list   and then: myai model use <id>"
+  assert_eq "$(env_get MODEL_ID)" fast "the model in use"
+  assert_not_contains "$(cat "$T/http.log")" "/resolve/main/" "requests for the file"
+  assert_not_called "up -d"
 }
 
 test_model_use_refuses_unknown_names_and_full_disks() {
@@ -615,18 +741,71 @@ test_heal_does_not_restart_a_model_that_is_still_loading() {
 
 test_heal_steps_aside_for_another_command() {
   myai_ready
-  # A backup (or an update) holds the lock.
-  (
-    flock 9
-    sleep 2
-  ) 9>"$APP/.lock" &
-  sleep 0.3
+  hold_lock 2 "myai backup"
   expect_ok cmd_heal
   assert_eq "$(cat "$FAKE_LOG")" "" "no docker call while another command works"
-  # Other commands say so instead of waiting silently.
-  expect_fail cmd_stop
-  assert_contains "$OUT" "Another myai command is still working"
+  assert_eq "$OUT" "" "the repair says nothing when it steps aside"
   wait
+}
+
+# ------------------------------------------------------------------- lock ---
+
+test_lock_commands_wait_for_a_short_holder() {
+  local began
+  myai_ready
+  # The 5-minute repair holds the lock for a moment when the backup starts.
+  hold_lock 2 "myai heal"
+  began=$SECONDS
+  expect_ok cmd_backup
+  assert_contains "$OUT" "Waiting for myai heal (process "
+  assert_contains "$OUT" ", since 10:02) to finish (at most 15 minutes)"
+  assert_contains "$OUT" "Backup written"
+  [ $((SECONDS - began)) -ge 1 ] || fail "the backup did not wait for the lock"
+  wait
+}
+
+test_lock_wait_has_a_limit_and_names_the_holder() {
+  myai_ready
+  hold_lock 3 "myai bench"
+  MYAI_LOCK_WAIT=1 expect_fail cmd_backup
+  assert_contains "$OUT" "Gave up waiting: myai bench (process "
+  assert_contains "$OUT" "Try again when it has finished"
+  assert_eq "$(backup_files | wc -l)" 0 "archives"
+  assert_not_called "docker compose"
+  wait
+}
+
+test_lock_commands_do_not_wait_for_the_installer() {
+  local began
+  myai_ready
+  hold_lock 3 "the installer"
+  began=$SECONDS
+  expect_fail cmd_stop
+  assert_contains "$OUT" "The installer is still running (process "
+  assert_contains "$OUT" "since 10:02"
+  assert_contains "$OUT" "tail -f /root/myai-install.log"
+  [ $((SECONDS - began)) -lt 3 ] || fail "it waited for the installer"
+  assert_no_file "$APP/.stopped"
+  assert_not_called "docker compose"
+  wait
+}
+
+test_lock_file_names_its_holder() {
+  local pid
+  myai_ready
+  pid=$(
+    # shellcheck disable=SC2034  # read by acquire_lock
+    MYAI_LOCK_NAME="myai backup"
+    acquire_lock
+    echo "$$"
+  )
+  [[ $(cat "$APP/.lock") =~ ^$pid\ [0-9]{2}:[0-9]{2}\ myai\ backup$ ]] || fail "the lock file says: $(cat "$APP/.lock")"
+  # Free again: the next command takes the lock without waiting.
+  expect_ok cmd_backup
+  assert_not_contains "$OUT" "Waiting" "the output"
+  # The real command names itself (myai_ready loaded it for its functions only).
+  MYAI_SOURCE_ONLY=0 run_myai think on >/dev/null
+  assert_contains "$(cat "$APP/.lock")" " myai think"
 }
 
 test_heal_does_nothing_without_a_model_file() {
@@ -650,8 +829,7 @@ installed_system_files() {
 test_uninstall_keeps_data_by_default() {
   myai_ready
   installed_system_files
-  ASSUME_YES=1
-  expect_ok cmd_uninstall
+  ASSUME_YES=1 expect_ok cmd_uninstall
   assert_called "systemctl disable --now myai-backup.timer myai-heal.timer"
   assert_called "down --remove-orphans --volumes --rmi local"
   assert_eq "$(find "$MYAI_SYSROOT/etc/systemd/system" -name 'myai-*' | wc -l)" 0 "unit files left"
@@ -666,8 +844,7 @@ test_uninstall_keeps_data_by_default() {
 test_uninstall_purge_deletes_everything_of_myai() {
   myai_ready
   installed_system_files
-  ASSUME_YES=1
-  expect_ok cmd_uninstall --purge
+  ASSUME_YES=1 expect_ok cmd_uninstall --purge
   assert_no_file "$APP"
   assert_no_file "$MYAI_SYSROOT/root/myai-credentials.txt"
   assert_no_file "$MYAI_SYSROOT/usr/local/bin/myai"
@@ -707,6 +884,16 @@ test_main_refuses_without_root_or_installation() {
   rm "$APP/.env"
   expect_fail run_myai status
   assert_contains "$OUT" "myai is not set up in $APP"
+}
+
+test_main_makes_a_readable_settings_file_private() {
+  fake_install
+  chmod 640 "$APP/.env"
+  expect_ok run_myai status
+  assert_mode "$APP/.env" 600
+  assert_contains "$OUT" "could be read by other users of this server (mode 640)"
+  expect_ok run_myai status
+  assert_not_contains "$OUT" "other users" "the output"
 }
 
 test_main_unknown_command_points_to_help() {
@@ -797,6 +984,7 @@ test_doctor_names_problems_with_advice() {
   echo 2000000 >"$FAKE_DIR/df_avail_kb"
   rm "$APP/backups/"*
   # 30% of the CPU time is taken away between two readings.
+  # shellcheck disable=SC2329  # replaces the library function that doctor_cpu calls
   cpu_sample() {
     if [ -e "$T/second-reading" ]; then
       echo "11000 400 8500"
@@ -823,6 +1011,17 @@ test_doctor_names_problems_with_advice() {
   assert_contains "$OUT" "problem(s)"
 }
 
+test_doctor_explains_a_certificate_that_is_not_there_yet() {
+  doctor_ready
+  # Before Caddy has a certificate, the handshake itself fails (curl exit 35).
+  echo 35 >"$FAKE_DIR/https_rc"
+  echo 000 >"$FAKE_DIR/https_code"
+  expect_fail cmd_doctor
+  assert_contains "$OUT" "[PROBLEM]  The certificate for srv123456.hstgr.cloud is not valid (yet)."
+  assert_contains "$OUT" "Ports 80 and 443 are closed in your provider's firewall"
+  assert_not_contains "$OUT" "curl error" "the report"
+}
+
 test_doctor_localhost_and_stopped() {
   doctor_ready
   env_set SITE_ADDRESS localhost
@@ -842,4 +1041,44 @@ test_doctor_certificate_end_date() {
     -days 5 -subj "/CN=srv123456.hstgr.cloud" >/dev/null 2>&1 || skip "openssl cannot make a test certificate"
   expect_ok cmd_doctor
   [[ $OUT == *"The certificate ends in "[45]" days and was not renewed yet."* ]] || fail "no warning about the end date: $OUT"
+}
+
+# "tls <e-mail>" is Let's Encrypt with ZeroSSL as the second choice: a public
+# certificate, which must be checked like any other and never called self-signed.
+test_doctor_and_creds_check_a_certificate_with_a_contact_address() {
+  doctor_ready
+  env_set CADDY_TLS_LINE "tls owner@myai-test-domain.net"
+  "$REAL_OPENSSL" req -x509 -newkey rsa:2048 -nodes -keyout "$T/key.pem" -out "$FAKE_DIR/s_client_out" \
+    -days 5 -subj "/CN=srv123456.hstgr.cloud" >/dev/null 2>&1 || skip "openssl cannot make a test certificate"
+  : >"$FAKE_LOG"
+  expect_ok cmd_doctor
+  assert_contains "$OUT" "[ok]       HTTPS answers with a valid certificate (status 200)."
+  [[ $OUT == *"The certificate ends in "[45]" days and was not renewed yet."* ]] || fail "the end date was not checked: $OUT"
+  assert_not_contains "$OUT" "self-signed" "the report"
+  assert_not_called " -k "
+  expect_ok cmd_creds
+  assert_not_contains "$OUT" "self-signed" "the credentials"
+  assert_not_contains "$OUT" "Advanced" "the credentials"
+  # Only "tls internal" is self-signed.
+  env_set CADDY_TLS_LINE "tls internal"
+  expect_ok cmd_creds
+  assert_contains "$OUT" "this server uses a self-signed certificate"
+}
+
+test_doctor_certificate_advice_fits_the_certificate_line() {
+  doctor_ready
+  echo 60 >"$FAKE_DIR/https_rc"
+  echo 000 >"$FAKE_DIR/https_code"
+  env_set CADDY_TLS_LINE "tls owner@myai-test-domain.net"
+  expect_fail cmd_doctor
+  assert_contains "$OUT" "The certificate services refused the contact address in CADDY_TLS_LINE"
+  assert_not_contains "$OUT" "sslip.io" "the advice for a name of its own"
+  # A name from sslip.io without a contact: the shared limit, and how to get a second service.
+  env_set SITE_ADDRESS 203-0-113-10.sslip.io
+  echo "203.0.113.10" >"$FAKE_DIR/dig_A_203-0-113-10.sslip.io"
+  env_set CADDY_TLS_LINE ""
+  expect_fail cmd_doctor
+  assert_contains "$OUT" "The weekly limit that all names ending in sslip.io share is used up"
+  assert_contains "$OUT" "CADDY_TLS_LINE='tls you@your-domain'"
+  assert_not_contains "$OUT" "refused the contact address" "the advice without a contact address"
 }

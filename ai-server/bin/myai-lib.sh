@@ -187,6 +187,27 @@ env_get() {
 
 env_has() { env_get "$1" "${2:-}" >/dev/null 2>&1; }
 
+# The settings file holds every secret, so only root may read it (mode 600).
+# A copy made by hand from .env.example usually gets 644.
+secure_env_file() {
+  local file mode
+  file=$(env_file)
+  [ -f "$file" ] || return 0
+  mode=$(stat -c %a -- "$file" 2>/dev/null) || return 0
+  case "$mode" in
+    *00) return 0 ;; # nobody but the owner can read it
+  esac
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would make $file readable by root only (its mode is $mode)"
+    return 0
+  fi
+  if chmod 600 -- "$file"; then
+    warn "$file could be read by other users of this server (mode $mode). It is now readable by root only."
+  else
+    warn "$file can be read by other users of this server (mode $mode). Fix it with: chmod 600 $file"
+  fi
+}
+
 # How a value is written in the file: as it is when it is made of harmless
 # characters, otherwise in single quotes (Docker Compose reads both).
 env_quote() {
@@ -236,6 +257,18 @@ env_set() {
   fi
   chmod 600 "$tmp"
   mv -f "$tmp" "$file"
+}
+
+# ----------------------------------------------------------- data folders ---
+
+# The folders under DATA_DIR with their owners: the models, the web data and
+# the certificates belong to root; the agent and the sandbox run as user
+# 10001 and share the workspace. A folder that exists gets the right owner
+# and mode; what is inside it is not touched.
+make_data_dirs() { # DATA
+  run install -d -m 755 -o root -g root "$1" "$1/models" "$1/webui" \
+    "$1/caddy" "$1/caddy/data" "$1/caddy/config" &&
+    run install -d -m 750 -o 10001 -g 10001 "$1/agent" "$1/workspace"
 }
 
 # -------------------------------------------------------- model catalogue ---
@@ -606,18 +639,24 @@ except Exception as exc:
 if task.get("status") != "done":
     print("error the task ended as %s: %s" % (task.get("status"), str(task.get("error") or "")[:200]))
     sys.exit(1)
-steps = task.get("steps") or []
-tools = sum(1 for s in steps if isinstance(s, dict) and s.get("t") == "tool")
-print("ok %d %.1f" % (tools, time.time() - began))
+# The task log: {"t": "tool", "name": ..., "ok": true|false, ...} for each tool call.
+used = [str(s.get("name") or "?") for s in task.get("steps") or []
+        if isinstance(s, dict) and s.get("t") == "tool" and s.get("ok")]
+print("ok %d %.1f %s" % (len(used), time.time() - began, ",".join(used) or "-"))
 '
 
 # agent_task PROMPT [TIMEOUT_SECONDS]: runs one agent task to the end.
-# Prints "ok <tool calls logged> <seconds>" or "error <reason>".
+# Prints "ok <tool calls that worked> <seconds> <their tool names, or ->"
+# or "error <reason>".
 agent_task() {
   dc exec -T agent python -c "$AGENT_TASK_PY" "$1" "${2:-900}" 2>&1
 }
 
 # ---------------------------------------------------------- model download ---
+
+# What to do when a model cannot be used. The installer sets its own advice:
+# during the first installation the myai command does not exist yet.
+: "${MODEL_CHOICE_HINT:=Choose another model: myai model list   and then: myai model use <id>}"
 
 file_size() { stat -c %s -- "$1" 2>/dev/null; }
 
@@ -730,7 +769,7 @@ download_verified() {
         die "The model file could not be downloaded (the server answered $FETCH_HTTP_CODE)." \
           "Address: $url" \
           "The file may have been renamed or removed by its publisher." \
-          "Choose another model: myai model list"
+          "$MODEL_CHOICE_HINT"
         ;;
     esac
     have=$(file_size "$part") || have=0
@@ -749,8 +788,8 @@ download_verified() {
   if [ -n "$want" ] && [ "$have" != "$want" ]; then
     rm -f -- "$part"
     die "The downloaded file has the wrong size ($have bytes, expected $want)." \
-      "It was removed. The model was probably replaced by its publisher." \
-      "Run the same command again. If the size is wrong again, use another model: myai model list"
+      "It was removed. Something between this server and Hugging Face may have cut it short." \
+      "Run the same command again. If the size is wrong again: $MODEL_CHOICE_HINT"
   fi
   if ! file_is_gguf "$part"; then
     rm -f -- "$part"
@@ -798,6 +837,19 @@ download_model() {
     [[ $size =~ ^[0-9]+$ ]] || size=""
     [[ $sha =~ ^[0-9a-f]{64}$ ]] || sha=""
   fi
+  # Another size than the catalogue's means the publisher has uploaded a new
+  # file under the same name. It would be downloaded in full and then fail
+  # the size check, on every try, so stop before the download. A partial
+  # file of the old upload can never be completed either.
+  if [ -n "$want" ] && [ -n "$size" ] && [ "$size" != "$want" ]; then
+    if [ -f "$dest.part" ]; then
+      rm -f -- "$dest.part"
+      note "Removed the partial download of the old file ($dest.part)."
+    fi
+    die "The publisher has replaced the model file $(basename "$file"): Hugging Face lists it with $size bytes, the model list of myai with $want." \
+      "The new file cannot be checked, so nothing was downloaded." \
+      "$MODEL_CHOICE_HINT"
+  fi
   if [ -z "$want" ]; then want=$size; fi
 
   mkdir -p "$dir"
@@ -805,6 +857,38 @@ download_model() {
   note "A progress line appears every $MYAI_PROGRESS_SECS seconds. If this stops, run the same command again: it continues."
   download_verified "$url" "$dest" "$want" "$sha"
   note "Model file ready: $dest"
+}
+
+# ------------------------------------------------------------ certificate ---
+# CADDY_TLS_LINE (see the Caddyfile) has three forms:
+#   ""              a certificate from Let's Encrypt
+#   "tls internal"  a self-signed certificate (localhost, a bare IP address)
+#   "tls <e-mail>"  Let's Encrypt, and ZeroSSL when that fails; both services
+#                   need a contact address for it. A public certificate too.
+
+tls_is_self_signed() { [[ ${1:-} =~ ^[[:space:]]*tls[[:space:]]+internal[[:space:]]*$ ]]; }
+
+# Prints the contact address of a "tls <e-mail>" line; fails for the others.
+tls_contact() {
+  [[ ${1:-} =~ ^[[:space:]]*tls[[:space:]]+([^[:space:]]+@[^[:space:]]+)[[:space:]]*$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# True for an address that can be the contact for the certificate: a real
+# one. Let's Encrypt refuses example and reserved domains, and with a refused
+# address it issues no certificate at all.
+usable_contact_email() {
+  local domain
+  valid_email "${1:-}" || return 1
+  domain=${1##*@}
+  domain=${domain,,}
+  case "$domain" in
+    example.* | *.example.* | *.example | *.test | *.invalid | *.localhost | *.local | *.localdomain | \
+      *.internal | *.lan | *.home | *.arpa)
+      return 1
+      ;;
+  esac
+  return 0
 }
 
 # ------------------------------------------------------ links and secrets ---
@@ -840,8 +924,8 @@ credentials_text() {
      E-mail:    $email
      Password:  $password
 
-   (This is the first password. If you change it in the chat page, the new
-   one counts there.)
+   (These are the first login details. If you change them in the chat page,
+   the new ones count there.)
 
 3. The agent dashboard (tasks, schedules, notes):
 
@@ -853,7 +937,9 @@ credentials_text() {
      b. On this server run:   myai telegram set
      c. Send your new bot this message:   /pair $code
 EOF
-  if [ -n "$tls" ]; then
+  # Only then: teaching anyone to click past a certificate warning on a site
+  # with a public certificate would be dangerous.
+  if tls_is_self_signed "$tls"; then
     cat <<EOF
 
 Note: this server uses a self-signed certificate. Your browser will show a
@@ -864,13 +950,68 @@ EOF
 
 # ------------------------------------------------------------------- lock ---
 
-# One myai command that changes things at a time. The lock is released when
-# the process (and anything it starts) ends.
+# One command that changes things at a time: the installer, an update, a
+# backup, a benchmark, the 5-minute repair. The lock is released when the
+# process (and anything it starts) ends. The lock file names its holder, so
+# that a second command can say what it is waiting for.
+
+# Seconds a command waits for another one to finish.
+: "${MYAI_LOCK_WAIT:=900}"
+
+# Reads the holder from the lock file into LOCK_PID, LOCK_SINCE and
+# LOCK_WHAT (LOCK_WHAT is empty when the file names nobody).
+read_lock_holder() {
+  local line
+  LOCK_PID=""
+  LOCK_SINCE=""
+  LOCK_WHAT=""
+  line=$(head -n 1 -- "$APP_DIR/.lock" 2>/dev/null) || line=""
+  read -r LOCK_PID LOCK_SINCE LOCK_WHAT <<<"$line" || true
+  [[ $LOCK_PID =~ ^[0-9]+$ ]] || LOCK_WHAT=""
+}
+
+# "myai backup (process 4242, since 03:15)", or "another myai command".
+lock_holder() {
+  read_lock_holder
+  if [ -n "$LOCK_WHAT" ]; then
+    printf '%s (process %s, since %s)\n' "$LOCK_WHAT" "$LOCK_PID" "$LOCK_SINCE"
+  else
+    printf 'another myai command\n'
+  fi
+}
+
+# True while another process holds the lock.
+lock_is_held() {
+  [ -f "$APP_DIR/.lock" ] && ! flock -n "$APP_DIR/.lock" true 2>/dev/null
+}
+
+# Stops with advice when the holder is the installer: it can take an hour,
+# which is too long to wait for.
+refuse_while_installing() {
+  read_lock_holder
+  if [ "$LOCK_WHAT" = "the installer" ]; then
+    die "The installer is still running (process $LOCK_PID, since $LOCK_SINCE)." \
+      "Wait until it has finished, then try again." \
+      "If the Hostinger post-install script started it, watch it with: tail -f /root/myai-install.log"
+  fi
+}
+
+# acquire_lock [wait|try]
+#   wait (the default): wait up to MYAI_LOCK_WAIT seconds for the holder,
+#                       but stop at once when it is the installer
+#   try:                give up at once (the 5-minute repair)
+# MYAI_LOCK_NAME says what this command is, for the others to see.
 acquire_lock() {
-  local mode=${1:-wait}
-  exec 9>"$APP_DIR/.lock"
-  if flock -n 9; then return 0; fi
-  if [ "$mode" = try ]; then return 1; fi
-  die "Another myai command is still working (a backup, an update or a benchmark)." \
-    "Wait a few minutes and try again."
+  local mode=${1:-wait} holder
+  # ">>": opening the file must not empty it while it names another holder.
+  exec 9>>"$APP_DIR/.lock"
+  if ! flock -n 9; then
+    if [ "$mode" = try ]; then return 1; fi
+    refuse_while_installing
+    holder=$(lock_holder)
+    note "Waiting for $holder to finish (at most $((MYAI_LOCK_WAIT / 60)) minutes) ..."
+    flock -w "$MYAI_LOCK_WAIT" 9 ||
+      die "Gave up waiting: $holder is still working." "Try again when it has finished."
+  fi
+  printf '%s %s %s\n' "$$" "$(date +%H:%M)" "${MYAI_LOCK_NAME:-a myai command}" >"$APP_DIR/.lock" 2>/dev/null || true
 }

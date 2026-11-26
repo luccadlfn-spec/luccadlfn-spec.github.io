@@ -81,7 +81,11 @@ def build_toolbox(d: ToolDeps) -> Toolbox:
             return "No schedules."
         return "\n".join(f"{d.schedules.describe(x)} | {x['prompt'][:80]}" for x in items)
 
-    async def cancel_schedule(a: dict, _: CallContext) -> str:
+    async def cancel_schedule(a: dict, ctx: CallContext) -> str:
+        if ctx.scheduled and a["id"] != ctx.schedule_id:
+            # Same reason as above: a page read unattended must not remove the owner's other
+            # jobs. Ending its own schedule ("stop once the parcel has arrived") is fine.
+            raise ToolError("a scheduled task can only cancel its own schedule")
         if not d.schedules.delete(a["id"]):
             raise ToolError(f"there is no schedule #{a['id']}")
         return f"Schedule #{a['id']} cancelled."

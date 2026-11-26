@@ -72,6 +72,8 @@ test_lint_installer_help_needs_nothing() {
   out=$(PATH=/usr/bin:/bin bash "$AI_DIR/install.sh" --help)
   assert_contains "$out" "--dry-run"
   assert_contains "$out" "--skip-model-download"
+  # A real admin e-mail leaves the machine as the certificate contact: say so.
+  assert_contains "$out" "HTTPS certificate at Let's Encrypt and ZeroSSL"
   out=$(PATH=/usr/bin:/bin bash "$AI_DIR/bin/myai" help)
   assert_contains "$out" "myai doctor"
   assert_contains "$out" "myai uninstall"

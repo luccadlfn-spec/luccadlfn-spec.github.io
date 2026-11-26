@@ -146,6 +146,36 @@ async def test_passthrough_propagates_upstream_errors(make_services, client_for,
     assert len(llm.requests) == 1                                   # pass-through never retries
 
 
+class BreaksAfter(httpx.AsyncByteStream):
+    """A response body that delivers some bytes, then fails the way a dying server does."""
+
+    def __init__(self, first: bytes, error: Exception):
+        self._first, self._error = first, error
+
+    async def __aiter__(self):
+        yield self._first
+        raise self._error
+
+
+@pytest.mark.parametrize("error,wording", [
+    (httpx.RemoteProtocolError("peer closed connection without sending complete message body"), "middle of the answer"),
+    (httpx.ReadTimeout("no data"), "for too long"),
+])
+async def test_a_stream_that_breaks_off_ends_with_an_error_event(make_services, client_for, error, wording):
+    first = b'data: {"choices":[{"index":0,"delta":{"content":"The answer is"},"finish_reason":null}]}\n\ndata: {"cho'
+    llm = FakeLLM(httpx.Response(200, headers={"content-type": "text/event-stream"}, stream=BreaksAfter(first, error)))
+    sv = await make_services(llm)
+    async with client_for(sv) as c:
+        r = await c.post(CHAT, headers=BEARER, json={"model": "assistant", "stream": True,
+                                                     "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200 and r.content.startswith(first)        # what arrived is passed on as it was
+    rest = r.content[len(first):]
+    assert rest.startswith(b"\n\ndata: ")                              # the half-written event is closed off
+    ev = events(rest)
+    assert ev[-1] == "[DONE]" and ev[-2]["error"]["type"] == "upstream_error"
+    assert wording in ev[-2]["error"]["message"]
+
+
 async def test_passthrough_reports_an_unreachable_model_server(make_services, client_for):
     llm = FakeLLM(httpx.ConnectError("refused"), httpx.ReadTimeout("slow"))
     sv = await make_services(llm)
@@ -170,9 +200,38 @@ def test_split_messages_keeps_text_only():
     ])
     assert system == "Answer in French." and user == "look at\nthis"
     assert history == [{"role": "user", "content": "first"}, {"role": "assistant", "content": "réponse"}]
-    for bad in ([], "text", [{"role": "assistant", "content": "only me"}], [{"role": "user", "content": ""}], None):
+    for bad in ([], "text", [{"role": "assistant", "content": "only me"}], None):
         with pytest.raises(ApiError):
             split_messages(bad)
+
+
+def test_a_newest_message_without_text_is_never_replaced_by_an_older_one():
+    image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]
+    history, user, _ = split_messages([{"role": "user", "content": "What is the capital of France?"},
+                                       {"role": "assistant", "content": "Paris."},
+                                       {"role": "user", "content": image}])
+    assert user == "" and history[0]["content"] == "What is the capital of France?"
+    assert split_messages([{"role": "user", "content": "   "}])[1] == ""
+
+
+@pytest.mark.parametrize("stream", [False, True])
+async def test_the_agent_says_it_cannot_read_a_message_without_text(make_services, client_for, stream):
+    llm = FakeLLM()
+    sv = await make_services(llm)
+    image = [{"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}]
+    body = {"model": "agent", "stream": stream, "messages": [
+        {"role": "user", "content": "What is the capital of France?"}, {"role": "assistant", "content": "Paris."},
+        {"role": "user", "content": image}]}
+    async with client_for(sv) as c:
+        r = await c.post(CHAT, headers=BEARER, json=body)
+    assert r.status_code == 200 and llm.requests == []              # nothing older is answered instead
+    if stream:
+        ev = events(r.content)
+        text = "".join(c["choices"][0]["delta"].get("content", "") for c in ev[:-1] if c["choices"])
+        assert ev[-1] == "[DONE]" and ev[-2]["choices"][0]["finish_reason"] == "stop"
+    else:
+        text = r.json()["choices"][0]["message"]["content"]
+    assert text.startswith("I can only read text")
 
 
 async def test_agent_streaming_format(make_services, client_for, tmp_path):

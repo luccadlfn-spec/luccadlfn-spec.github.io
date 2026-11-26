@@ -94,6 +94,7 @@ class Settings:
     telegram_allowed_ids: frozenset[int] = frozenset()
     pairing_code: str = ""
     tz_name: str = "UTC"
+    trusted_proxies: tuple[str, ...] = ("caddy",)   # peers whose X-Forwarded-For names the client
 
     thinking: str = "auto"              # off | on | auto
     max_steps: int = 12                 # LLM calls per turn
@@ -149,6 +150,7 @@ class Settings:
             telegram_allowed_ids=_ids(e, "TELEGRAM_ALLOWED_IDS"),
             pairing_code=_text(e, "PAIRING_CODE", ""),
             tz_name=_text(e, "TZ", d.tz_name),
+            trusted_proxies=tuple(p for p in re.split(r"[,\s]+", _text(e, "AGENT_TRUSTED_PROXIES", "caddy")) if p),
             thinking=thinking,
             max_steps=_int(e, "AGENT_MAX_STEPS", d.max_steps, 1, 50),
             ctx_tokens=_int(e, "AGENT_CTX_TOKENS", d.ctx_tokens, 2000, 200_000),

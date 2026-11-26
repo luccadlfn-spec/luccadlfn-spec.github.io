@@ -133,6 +133,26 @@ start_fileserver() {
   export MYAI_HF_BASE="http://127.0.0.1:$HF_PORT"
 }
 
+# hold_lock SECONDS NAME: another process holds the myai lock of $APP for
+# SECONDS and names itself NAME in the lock file, as acquire_lock does.
+# Returns once the lock is held. $APP must exist.
+hold_lock() {
+  local tries=0
+  rm -f "$T/holding"
+  (
+    exec 9>>"$APP/.lock"
+    flock 9
+    printf '%s 10:02 %s\n' "$BASHPID" "$2" >"$APP/.lock"
+    : >"$T/holding"
+    sleep "$1"
+  ) &
+  while [ ! -e "$T/holding" ]; do
+    tries=$((tries + 1))
+    [ "$tries" -lt 200 ] || fail "the process that should hold the lock did not start"
+    sleep 0.05
+  done
+}
+
 # ------------------------------------------------------------- assertions ---
 
 fail() {

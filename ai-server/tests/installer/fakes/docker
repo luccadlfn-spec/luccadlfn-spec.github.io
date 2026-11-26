@@ -53,6 +53,7 @@ case "${1:-}" in
     cat "$D/repodigests" 2>/dev/null
     exit 0
     ;;
+  pull) exit "$(cat "$D/rc_docker_pull" 2>/dev/null || echo 0)" ;;
   compose) shift ;;
   *) exit 0 ;;
 esac
@@ -71,6 +72,13 @@ while [ $# -gt 0 ]; do
 done
 verb=${1:-}
 [ $# -gt 0 ] && shift
+
+# A model server build given only for this call (the installer tries a new
+# build this way): log it, and what the settings file says meanwhile.
+if [ "$verb" = up ] && [ -n "${LLAMA_IMAGE:-}" ]; then
+  printf 'compose up: LLAMA_IMAGE=%s given for this call; the settings file says LLAMA_IMAGE=%s\n' \
+    "$LLAMA_IMAGE" "$(sed -n 's/^LLAMA_IMAGE=//p' "$envfile" 2>/dev/null | head -n 1)" >>"${FAKE_LOG:-/dev/null}"
+fi
 
 case "$verb" in
   version) echo "Docker Compose version v5.0.0" ;;
@@ -93,7 +101,7 @@ case "$verb" in
         fi
         ;;
       */tasks*)
-        reply=$(cat "$D/task_reply" 2>/dev/null || echo "ok 1 20.0")
+        reply=$(cat "$D/task_reply" 2>/dev/null || echo "ok 1 20.0 write_file")
         if [ -s "$D/task_proof" ]; then : >"$(cat "$D/task_proof")"; fi
         ;;
       *) reply="error unknown script" ;;

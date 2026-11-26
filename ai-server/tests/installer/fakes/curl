@@ -30,6 +30,19 @@ for arg in "$@"; do
       echo "fake docker key" >"$out"
       exit 0
       ;;
+    https://raw.githubusercontent.com/)
+      exit 0 # hostinger/post-install.sh checks that the network is up
+      ;;
+    https://raw.githubusercontent.com/*/ai-server/install.sh)
+      # owner/name/REF/ai-server/install.sh -> $FAKE_DIR/raw_REF_install.sh
+      rest=${arg#https://raw.githubusercontent.com/}
+      rest=${rest#*/*/}
+      ref=${rest%/ai-server/install.sh}
+      src="$D/raw_${ref//\//_}_install.sh"
+      [ -f "$src" ] || exit 22
+      cp "$src" "$out"
+      exit 0
+      ;;
     http://127.0.0.1:* | http://127.0.0.1/*) exec "${REAL_CURL:?}" "$@" ;;
     https://*)
       # The doctor's HTTPS check: status and exit code come from files.

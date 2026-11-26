@@ -33,6 +33,7 @@ class Param:
 class CallContext:
     background: bool = False               # governed, low-priority run
     scheduled: bool = False                # started by the scheduler, nobody is watching
+    schedule_id: int | None = None         # the schedule that started this run
 
 
 Handler = Callable[[dict[str, Any], CallContext], Awaitable[str]]

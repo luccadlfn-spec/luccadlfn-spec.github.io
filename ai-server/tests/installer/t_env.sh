@@ -150,6 +150,29 @@ test_config_covers_every_key_of_env_example() {
   done < <(grep -o -E '^[A-Z][A-Z0-9_]*=' "$AI_DIR/.env.example" | tr -d '=')
 }
 
+test_config_writes_every_value_compose_requires() {
+  local key n=0
+  [ -f "$AI_DIR/docker-compose.yml" ] || skip "docker-compose.yml is not there yet"
+  run_config >/dev/null 2>&1
+  load_installer
+  # ${NAME:?message} stops Compose when the value is missing or empty. Also
+  # checked without Docker, unlike the test below. Comment lines do not count.
+  while IFS= read -r key; do
+    n=$((n + 1))
+    [ -n "$(env_get "$key")" ] || fail "docker-compose.yml requires $key, but the installer does not write a value for it"
+  done < <(grep -v '^[[:space:]]*#' "$AI_DIR/docker-compose.yml" | grep -o -E '\$\{[A-Z_][A-Z0-9_]*:\?' |
+    sed -E 's/^\$\{//; s/:\?$//' | sort -u)
+  [ "$n" -gt 0 ] || fail "found no required value in docker-compose.yml"
+}
+
+test_config_governor_is_written_as_off_on_other_servers() {
+  echo "box.example.net" >"$FAKE_DIR/fqdn"
+  run_config >/dev/null 2>&1
+  load_installer
+  # A missing line would not mean off: compose passes ${CPU_GOVERNOR:-on}.
+  assert_eq "$(env_get CPU_GOVERNOR)" off
+}
+
 test_config_real_compose_accepts_the_generated_file() {
   [ -n "$REAL_DOCKER" ] || skip "docker is not installed"
   [ -f "$AI_DIR/docker-compose.yml" ] || skip "docker-compose.yml is not there yet"
@@ -157,6 +180,13 @@ test_config_real_compose_accepts_the_generated_file() {
   run_config >/dev/null 2>&1
   expect_ok "$REAL_DOCKER" compose --project-directory "$AI_DIR" -f "$AI_DIR/docker-compose.yml" \
     --env-file "$APP/.env" config -q
+  # A certificate contact: a quoted value with a space, which Caddy must get whole.
+  rm "$APP/.env"
+  run_config --admin-email owner@myai-test-domain.net >/dev/null 2>&1
+  expect_ok "$REAL_DOCKER" compose --project-directory "$AI_DIR" -f "$AI_DIR/docker-compose.yml" \
+    --env-file "$APP/.env" config --format json
+  assert_eq "$(jq -r '.services.caddy.environment.CADDY_TLS_LINE' <<<"$OUT")" "tls owner@myai-test-domain.net" \
+    "CADDY_TLS_LINE as Caddy gets it"
 }
 
 test_config_rerun_keeps_the_file_byte_for_byte() {
@@ -167,6 +197,20 @@ test_config_rerun_keeps_the_file_byte_for_byte() {
 $(diff "$T/first" "$APP/.env")"
   assert_contains "$OUT" "Kept $APP/.env as it is"
   assert_mode "$APP/.env" 600
+}
+
+test_config_rerun_makes_a_readable_settings_file_private() {
+  run_config >/dev/null 2>&1
+  # As a copy made by hand from .env.example would be.
+  chmod 644 "$APP/.env"
+  cp -p "$APP/.env" "$T/before"
+  expect_ok run_config
+  assert_mode "$APP/.env" 600
+  assert_contains "$OUT" "could be read by other users of this server (mode 644). It is now readable by root only."
+  cmp -s "$T/before" "$APP/.env" || fail "the content of the settings file changed"
+  # Already private: nothing is said.
+  expect_ok run_config
+  assert_not_contains "$OUT" "other users" "the output"
 }
 
 test_config_rerun_adds_only_what_is_missing() {
@@ -225,6 +269,99 @@ test_config_admin_email_option_on_first_run() {
   run_config --admin-email me@example.com >/dev/null 2>&1
   load_installer
   assert_eq "$(env_get WEBUI_ADMIN_EMAIL)" "me@example.com"
+}
+
+# ------------------------------------------- certificate contact, login ---
+
+# A made-up domain that is not reserved: the tests never contact it.
+REAL_MAIL="owner@myai-test-domain.net"
+
+test_config_real_admin_email_becomes_the_certificate_contact() {
+  echo "2001:db8::77" >"$FAKE_DIR/dig_AAAA_srv123456.hstgr.cloud"
+  expect_ok run_config --admin-email "$REAL_MAIL"
+  load_installer
+  # Caddy then also tries ZeroSSL when Let's Encrypt fails.
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls $REAL_MAIL"
+  assert_eq "$(env_get WEBUI_ADMIN_EMAIL)" "$REAL_MAIL"
+  assert_contains "$OUT" "Certificate: from Let's Encrypt, or ZeroSSL when that fails (contact address: $REAL_MAIL)"
+  assert_not_contains "$OUT" "self-signed" "the output"
+  # A public certificate: an IPv6 record that leads elsewhere still matters.
+  assert_contains "$OUT" "also has an IPv6 address (2001:db8::77)"
+}
+
+test_config_placeholder_or_reserved_email_is_never_a_certificate_contact() {
+  local e
+  # Let's Encrypt refuses these, and then issues no certificate at all.
+  for e in owner@example.com me@example.org me@mail.example.net me@example.de me@box.test me@srv.local \
+    me@x.invalid me@nas.lan me@pc.internal; do
+    rm -f "$APP/.env"
+    run_config --admin-email "$e" >"$T/out" 2>&1 || fail "write_config failed for $e: $(cat "$T/out")"
+    load_installer
+    assert_eq "$(env_get CADDY_TLS_LINE)" "" "certificate line for $e"
+    assert_contains "$(cat "$T/out")" "Certificate: from Let's Encrypt"
+  done
+  # Addresses that need a self-signed certificate keep it, whatever the e-mail.
+  rm -f "$APP/.env"
+  run_config --admin-email "$REAL_MAIL" --tls-internal >/dev/null 2>&1
+  load_installer
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls internal"
+  rm -f "$APP/.env"
+  run_config --admin-email "$REAL_MAIL" --domain 203.0.113.10 >/dev/null 2>&1
+  load_installer
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls internal"
+}
+
+test_config_domain_change_keeps_the_certificate_contact() {
+  echo "203.0.113.10" >"$FAKE_DIR/dig_A_chat.example.com"
+  run_config --admin-email "$REAL_MAIL" >/dev/null 2>&1
+  load_installer
+  # The owner chose another contact by hand, as .env.example explains.
+  env_set CADDY_TLS_LINE "tls certs@myai-test-domain.net"
+  expect_ok run_config --domain chat.example.com
+  load_installer
+  assert_eq "$(env_get SITE_ADDRESS)" "chat.example.com"
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls certs@myai-test-domain.net" "the certificate line after --domain"
+  assert_contains "$OUT" "contact address: certs@myai-test-domain.net"
+  assert_not_contains "$OUT" "self-signed" "the output"
+  # A bare IP address needs the self-signed certificate ...
+  run_config --domain 203.0.113.10 >/dev/null 2>&1
+  load_installer
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls internal"
+  # ... and back on a name, the contact is the login address again.
+  run_config --domain chat.example.com >/dev/null 2>&1
+  load_installer
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls $REAL_MAIL"
+}
+
+test_config_admin_email_option_cannot_change_an_existing_login() {
+  run_config --admin-email "$REAL_MAIL" >/dev/null 2>&1
+  # Open WebUI has started once: its database holds the login now.
+  mkdir -p "$APP/data/webui"
+  echo "chat database" >"$APP/data/webui/webui.db"
+  cp -p "$APP/.env" "$T/first"
+  expect_ok run_config --admin-email second@myai-test-domain.net
+  load_installer
+  assert_eq "$(env_get WEBUI_ADMIN_EMAIL)" "$REAL_MAIL" "the login in the settings"
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls $REAL_MAIL" "the certificate contact"
+  cmp -s "$T/first" "$APP/.env" || fail "the settings file changed:
+$(diff "$T/first" "$APP/.env")"
+  assert_contains "$OUT" "The chat page already has its login, $REAL_MAIL. --admin-email cannot change it any more"
+  assert_contains "$OUT" "open the Admin Panel, Users, and edit your user"
+  # The credentials sheet names the login that works.
+  assert_contains "$(credentials_text)" "E-mail:    $REAL_MAIL"
+}
+
+test_config_admin_email_option_before_the_chat_ever_started() {
+  # The first run stopped before the services were started: nothing holds
+  # the login yet, so the new address is used, for the certificate too.
+  run_config >/dev/null 2>&1
+  load_installer
+  assert_eq "$(env_get CADDY_TLS_LINE)" ""
+  expect_ok run_config --admin-email "$REAL_MAIL"
+  load_installer
+  assert_eq "$(env_get WEBUI_ADMIN_EMAIL)" "$REAL_MAIL"
+  assert_eq "$(env_get CADDY_TLS_LINE)" "tls $REAL_MAIL"
+  assert_not_contains "$OUT" "already has its login" "the output"
 }
 
 test_config_low_memory_server_gets_smaller_windows() {

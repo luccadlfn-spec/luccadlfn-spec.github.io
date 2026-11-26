@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Tests for install.sh and bin/myai. Nothing here touches the real system:
+# Tests for install.sh, bin/myai, hostinger/post-install.sh and
+# extras/claude-local.sh. Nothing here touches the real system:
 # every test runs in its own temporary directory, with fake commands (docker,
 # ufw, systemctl, apt-get, sshd, dig, ...) in front of PATH and a fake "/".
 #

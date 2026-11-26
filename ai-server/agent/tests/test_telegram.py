@@ -165,7 +165,7 @@ async def test_commands(bot_env):
     sv, tg = await bot_env(FakeLLM(say("done")))
     sv.schedules.add("0 8 * * *", "morning digest", "Digest")
     for text in ("/help", "/start", "/status", "/schedules", "/tasks", "/new", "/cancel", "/cancel 99",
-                 "/bogus", "/help@my_bot", "/pair 1"):
+                 "/bogus", "/help@my_bot", "/pair 1", "/cancel \u00b2", "/cancel 99999999999999999999"):
         tg.push(text)
     await sv.telegram.poll_once()
     out = tg.sent(OWNER)
@@ -177,6 +177,7 @@ async def test_commands(bot_env):
     assert out[6].startswith("Usage: /cancel") and out[7] == "There is no task #99."
     assert out[8].startswith("I do not know that command")
     assert out[10] == "You are already paired."
+    assert out[11].startswith("Usage: /cancel") and out[12].startswith("Usage: /cancel")     # not a crash
     assert sv.db.list_tasks() == []                                         # commands never reach the model
 
 
@@ -324,3 +325,44 @@ async def test_redaction_filter_scrubs_secrets_from_any_log_line(settings):
                                "HTTP Request: POST %s", (f"https://api.telegram.org/bot{TOKEN}/getUpdates",), None)
     assert Redact(cfg.secrets()).filter(record) is True
     assert TOKEN not in record.getMessage() and "<redacted>" in record.getMessage()
+
+
+async def test_work_cut_off_by_a_restart_is_reported_not_dropped(bot_env, settings):
+    from app.services import Services
+    started = asyncio.Event()
+
+    async def busy(_body):
+        started.set()
+        await asyncio.sleep(3600)                           # still working when the service stops
+
+    sv, tg = await bot_env(FakeLLM(busy))
+    sv.schedules.add("0 9 * * *", "daily digest", "Digest")
+    tg.push("What is on my calendar today?")
+    await sv.telegram.poll_once()
+    worker = asyncio.create_task(run_queue(sv))
+    await started.wait()
+    worker.cancel()                                         # what stopping the service does to the worker
+    await asyncio.gather(worker, return_exceptions=True)
+    chat_task = sv.db.list_tasks()[0]
+    assert chat_task["status"] == "running"                 # left for the next start to deal with
+    once = sv.schedules.add("in 1h", "check the backup", "Backup")
+    cut_off = sv.db.create_task("scheduled", "check the backup", status="running", background=True,
+                                schedule_id=once["id"], name="Backup")
+    sv.db.update_schedule(once["id"], next_run=None)        # it had fired
+
+    cfg = replace(settings, telegram_bot_token=TOKEN, telegram_api_base="https://telegram.test",
+                  telegram_allowed_ids=frozenset({OWNER, 5151}))
+    again = Services(cfg, telegram_transport=httpx.MockTransport(tg.handler))
+    await again.start(background=False)
+    try:
+        assert {t["id"] for t in again.interrupted} == {chat_task["id"], cut_off}
+        assert again.db.get_task(chat_task["id"])["error"] == "interrupted by restart"
+        await again.telegram.report_interrupted(again.interrupted)
+        to_owner = tg.sent(OWNER)
+        assert any(m.startswith("The server restarted while I was working on your message") and
+                   "What is on my calendar today?" in m for m in to_owner)
+        backup = 'Scheduled task "Backup" was interrupted by a server restart. It will be run again now.'
+        assert backup in to_owner and backup in tg.sent(5151)
+        assert again.db.get_schedule(once["id"])["next_run"] is not None     # due again
+    finally:
+        await again.stop()

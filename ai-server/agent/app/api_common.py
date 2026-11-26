@@ -27,7 +27,7 @@ def is_json(request: Request) -> bool:
 async def read_body(request: Request, limit: int) -> bytes:
     """Read the request body, refusing anything larger than `limit` bytes."""
     declared = request.headers.get("content-length", "")
-    if declared.isdigit() and int(declared) > limit:
+    if declared.isascii() and declared.isdigit() and int(declared) > limit:
         raise ApiError(413, "request body is too large")
     chunks, size = [], 0
     async for chunk in request.stream():
@@ -90,14 +90,6 @@ def close_soon(response: Any) -> None:
     _closing.add(task)
     task.add_done_callback(_closing.discard)
     task.add_done_callback(_retrieve)
-
-
-def client_id(request: Request) -> str:
-    """Who is calling, for rate limits: the address the nearest proxy saw, else the peer."""
-    forwarded = request.headers.get("x-forwarded-for", "")
-    if forwarded:
-        return forwarded.rsplit(",", 1)[-1].strip()[:64]
-    return request.client.host if request.client else "unknown"
 
 
 def openai_error(status: int, message: str, kind: str = "invalid_request_error",

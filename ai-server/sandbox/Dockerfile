@@ -20,12 +20,18 @@ RUN groupadd --gid 10001 sandbox \
  && mkdir /workspace \
  && chown 10001:10001 /workspace
 
+# startup/ holds the sitecustomize.py every snippet loads; it must stay in the
+# image (read-only), never in a place snippets can write to.
 COPY server.py /opt/sandbox/server.py
+COPY startup/ /opt/sandbox/startup/
 
 USER 10001:10001
 WORKDIR /workspace
 EXPOSE 8070
 
-# server.py must stay PID 1 (do not add an init): as PID 1 it cannot be killed
-# by the code it runs, and it relies on that to clean up stray processes.
+# server.py must stay PID 1 (do not add an init). As PID 1 it inherits every
+# orphan (and reaps them), kill(-1) reaches exactly the other processes of the
+# container, and the code it runs cannot stop it: the kernel drops signals
+# without a handler that come from inside the container, and server.py only
+# honours SIGTERM and SIGINT sent from outside it (docker stop).
 CMD ["python3", "/opt/sandbox/server.py"]

@@ -6,7 +6,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, tzinfo
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from croniter import croniter
 
@@ -35,9 +35,33 @@ class When:
     next_run: float           # epoch seconds
 
 
-def next_cron_run(expr: str, tz: tzinfo, after: float) -> float:
-    start = datetime.fromtimestamp(after, tz)
-    return croniter(expr, start).get_next(datetime).timestamp()
+def cron_runs(expr: str, tz: tzinfo, after: float, previous: float | None = None) -> Iterator[float]:
+    """Fire times of a cron expression after `after` (epoch seconds), in the server time zone.
+
+    On the night the clocks go back, an hour happens twice. A job at a fixed hour runs only
+    in the first of them, as classic cron does, instead of twice; jobs whose hour field is a
+    wildcard ("30 * * * *", "*/15 * * * *") keep their rhythm through both. `previous` is the
+    run that has just happened, if any.
+    """
+    it = croniter(expr, datetime.fromtimestamp(after, tz))
+    fixed_hour = not expr.split()[1].startswith("*")
+    last = _wall_minute(previous, tz) if previous is not None else None
+    while True:
+        nxt = it.get_next(datetime)
+        wall = nxt.replace(tzinfo=None, second=0, microsecond=0)
+        if fixed_hour and wall == last:
+            nxt = it.get_next(datetime)          # the same clock time again, an hour later
+            wall = nxt.replace(tzinfo=None, second=0, microsecond=0)
+        last = wall
+        yield nxt.timestamp()
+
+
+def _wall_minute(ts: float, tz: tzinfo) -> datetime:
+    return datetime.fromtimestamp(ts, tz).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def next_cron_run(expr: str, tz: tzinfo, after: float, previous: float | None = None) -> float:
+    return next(cron_runs(expr, tz, after, previous))
 
 
 def _check_cron(expr: str, tz: tzinfo, now: float, min_interval_min: int) -> None:
@@ -47,11 +71,11 @@ def _check_cron(expr: str, tz: tzinfo, now: float, min_interval_min: int) -> Non
     patterns = (_NUMERIC_FIELD, _NUMERIC_FIELD, _NUMERIC_FIELD, _NAMED_FIELD, _NAMED_FIELD)
     if not all(p.match(f) for p, f in zip(patterns, fields)) or not croniter.is_valid(expr):
         raise ScheduleError(f"'{expr}' is not a valid cron expression")
-    it = croniter(expr, datetime.fromtimestamp(now, tz))
     try:
-        prev = it.get_next(datetime).timestamp()
+        runs = cron_runs(expr, tz, now)          # the same sequence the scheduler will follow
+        prev = next(runs)
         for _ in range(_CRON_CHECK_FIRES):
-            cur = it.get_next(datetime).timestamp()
+            cur = next(runs)
             if cur - prev < min_interval_min * 60 - 1:
                 raise ScheduleError(
                     f"this schedule would run more often than every {min_interval_min} minutes; "
@@ -129,7 +153,7 @@ class ScheduleService:
         fields: dict[str, Any] = {"enabled": int(enabled)}
         if enabled and sched["kind"] == "cron":
             # Resume from now; runs missed while paused are not made up.
-            fields["next_run"] = next_cron_run(sched["cron"], self.s.tz, self._clock())
+            fields["next_run"] = next_cron_run(sched["cron"], self.s.tz, self._clock(), previous=sched["last_run"])
         self.db.update_schedule(schedule_id, **fields)
         return self.db.get_schedule(schedule_id)
 
@@ -139,11 +163,32 @@ class ScheduleService:
         for sched in self.db.list_schedules():
             if sched["kind"] == "cron":
                 try:
-                    self.db.update_schedule(sched["id"], next_run=next_cron_run(sched["cron"], self.s.tz, now))
+                    self.db.update_schedule(sched["id"], next_run=next_cron_run(
+                        sched["cron"], self.s.tz, now, previous=sched["last_run"]))
                 except Exception:
                     self.db.update_schedule(sched["id"], enabled=0)
 
+    def after_interruption(self, task: dict[str, Any]) -> str | None:
+        """A scheduled task was cut off by a restart. A one-shot has not done its job yet, so
+        it runs once more, but only once: a job that brings the service down must not do it
+        again and again. Returns what happens next, in words for the owner."""
+        sid = task.get("schedule_id")
+        sched = self.db.get_schedule(sid) if sid else None
+        if sched is None:
+            return None
+        if sched["kind"] == "cron":
+            return "It runs again at its next scheduled time."
+        if self.db.count_interrupted(sid) >= 2:
+            self.db.delete_schedule(sid)
+            return "It was interrupted twice, so it will not be run again."
+        self.db.update_schedule(sid, next_run=self._clock())
+        return "It will be run again now."
+
+    def next_text(self, sched: dict[str, Any]) -> str:
+        if sched["kind"] == "once" and sched["next_run"] is None:
+            return "running now"              # fired; removed once its run has finished
+        return self.fmt(sched["next_run"]) if sched["enabled"] else "-"
+
     def describe(self, sched: dict[str, Any]) -> str:
         state = "on" if sched["enabled"] else "paused"
-        return (f"#{sched['id']} [{state}] {sched['name']} | {sched['spec']} | "
-                f"next: {self.fmt(sched['next_run']) if sched['enabled'] else '-'}")
+        return f"#{sched['id']} [{state}] {sched['name']} | {sched['spec']} | next: {self.next_text(sched)}"

@@ -20,10 +20,25 @@ ENV_FILE="$APP_DIR/.env"
 BACKUP_KEEP=7
 BACKUP_STOPPED=()
 BACKUP_TMP=""
+BACKUP_FILE=""
 BENCH_RESTORE=""
 RESTORE_RESTART=0
+RESTORE_DATA=""
+RESTORE_STAGE=""
+RESTORE_MOVED=()
+RESTORE_ENV_SAVED=0
+RESTORE_DONE=0
 DOC_BAD=0
 DOC_LOOK=0
+
+# Runs when myai ends, however it ends. Each part does something only when
+# its command left work for it: one handler, so that a backup made during a
+# restore cannot replace the restore's own clean-up.
+myai_cleanup() {
+  backup_cleanup
+  restore_cleanup
+  bench_cleanup
+}
 
 cmd_help() {
   cat <<'EOF'
@@ -480,7 +495,7 @@ cmd_bench() {
   acquire_lock
   orig=$(env_get LLM_THREADS) || orig=$vcpus
   BENCH_RESTORE=$orig
-  trap bench_cleanup EXIT
+  trap myai_cleanup EXIT
 
   say ""
   say "  threads   speed"
@@ -532,9 +547,11 @@ backup_archive() {
   local out=$1 data rc=0
   data=$(data_dir)
   # The rename applies to file names and hard links, not to where symbolic
-  # links point (flag S).
+  # links point (flag S). ".restore.*" is the unpacked copy a restore works
+  # with; it never belongs in a backup.
   tar -czf "$out" -C "$APP_DIR" .env \
-    -C "$data" --anchored --exclude=./models --transform='s,^\./,data/,S;s,^\.$,data,S' . || rc=$?
+    -C "$data" --anchored --exclude=./models --exclude='./.restore.*' \
+    --transform='s,^\./,data/,S;s,^\.$,data,S' . || rc=$?
   # 1 means a file changed while it was read (the proxy keeps writing);
   # the archive is still usable.
   if [ "$rc" -gt 1 ]; then return "$rc"; fi
@@ -566,12 +583,19 @@ backup_cleanup() {
   fi
 }
 
-# make_backup: prints nothing but progress; the archive path is in BACKUP_FILE.
+# make_backup [keep-all]: prints nothing but progress; the archive path is in
+# BACKUP_FILE. With keep-all no older archive is deleted: a restore deletes
+# no backup, least of all the one it restores.
 make_backup() {
-  local dir="$APP_DIR/backups" svc out
+  local keep_all=${1:-} dir="$APP_DIR/backups" svc out
   mkdir -p "$dir"
   chmod 700 "$dir"
+  # A name of its own: never write over an archive that is already there.
   out="$dir/myai-$(date +%Y%m%d-%H%M%S).tar.gz"
+  while [ -e "$out" ]; do
+    sleep 1
+    out="$dir/myai-$(date +%Y%m%d-%H%M%S).tar.gz"
+  done
   BACKUP_TMP="$out.tmp"
   BACKUP_STOPPED=()
   # The chat and the agent keep their data in database files; they are
@@ -579,7 +603,7 @@ make_backup() {
   for svc in webui agent; do
     if svc_is_up "$svc"; then BACKUP_STOPPED+=("$svc"); fi
   done
-  trap backup_cleanup EXIT
+  trap myai_cleanup EXIT
   if [ ${#BACKUP_STOPPED[@]} -gt 0 ]; then
     dc stop "${BACKUP_STOPPED[@]}" >/dev/null 2>&1 ||
       die "Could not stop the chat and the agent for the backup." "See: myai status"
@@ -591,7 +615,7 @@ make_backup() {
   mv -f -- "$BACKUP_TMP" "$out"
   BACKUP_TMP=""
   backup_cleanup
-  rotate_backups "$dir" "$BACKUP_KEEP"
+  if [ "$keep_all" != keep-all ]; then rotate_backups "$dir" "$BACKUP_KEEP"; fi
   BACKUP_FILE=$out
 }
 
@@ -605,8 +629,80 @@ cmd_backup() {
 }
 
 # ----------------------------------------------------------------- restore ---
+# A restore unpacks the backup into a folder next to the data first, so a
+# backup that cannot be unpacked changes nothing. Only then are the services
+# stopped and the folders exchanged, by renaming: the current ones are moved
+# aside, and put back when anything fails before the restore is complete.
 
+# restore_swap DATA STAGE: put the unpacked folders in place. The ones of the
+# backup replace the current ones, and so do the four that myai backs up even
+# when the backup lacks one. The models stay.
+restore_swap() {
+  local data=$1 stage=$2 path name names=(webui agent workspace caddy)
+  for path in "$stage/data"/* "$stage/data"/.[!.]* "$stage/data"/..?*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    name=${path##*/}
+    case "$name" in
+      webui | agent | workspace | caddy | models) ;;
+      *) names+=("$name") ;;
+    esac
+  done
+  mkdir -p "$stage/old" || return 1
+  for name in "${names[@]}"; do
+    if [ -e "$data/$name" ] || [ -L "$data/$name" ]; then
+      mv -- "$data/$name" "$stage/old/$name" || return 1
+    fi
+    RESTORE_MOVED+=("$name")
+    if [ -e "$stage/data/$name" ] || [ -L "$stage/data/$name" ]; then
+      mv -- "$stage/data/$name" "$data/$name" || return 1
+    fi
+  done
+}
+
+# The settings file of the backup replaces the current one, which is kept
+# aside until the restore is complete.
+restore_env_file() {
+  local stage=$1
+  cp -p -- "$ENV_FILE" "$stage/old/.env" || return 1
+  RESTORE_ENV_SAVED=1
+  (umask 077 && cp -- "$stage/.env" "$ENV_FILE.restore") &&
+    chmod 600 -- "$ENV_FILE.restore" && mv -f -- "$ENV_FILE.restore" "$ENV_FILE"
+}
+
+# Undo a restore that stopped half-way. Fails when something could not be
+# put back; the folders from before then stay in the staging folder.
+restore_roll_back() {
+  local data=$RESTORE_DATA stage=$RESTORE_STAGE name ok=0
+  for name in ${RESTORE_MOVED[@]+"${RESTORE_MOVED[@]}"}; do
+    [ -n "$name" ] || continue # never the data folder itself
+    rm -rf -- "${data:?}/$name" || ok=1
+    if [ -e "$stage/old/$name" ] || [ -L "$stage/old/$name" ]; then
+      mv -- "$stage/old/$name" "$data/$name" || ok=1
+    fi
+  done
+  RESTORE_MOVED=()
+  if [ "$RESTORE_ENV_SAVED" = 1 ]; then
+    cp -p -- "$stage/old/.env" "$ENV_FILE" || ok=1
+    RESTORE_ENV_SAVED=0
+  fi
+  rm -f -- "$ENV_FILE.restore"
+  return "$ok"
+}
+
+# Runs when "myai restore" ends, however it ends: a restore that did not
+# finish is undone, the unpacked copy is removed, the services start again.
 restore_cleanup() {
+  if [ -n "$RESTORE_STAGE" ]; then
+    if [ "$RESTORE_DONE" != 1 ] && ! restore_roll_back; then
+      warn "Not everything could be put back as it was. Nothing is started."
+      warn "The folders from before are in $RESTORE_STAGE/old; the state from before is also in ${BACKUP_FILE:-the newest backup}."
+      RESTORE_STAGE=""
+      RESTORE_RESTART=0
+      return 0
+    fi
+    rm -rf -- "$RESTORE_STAGE"
+    RESTORE_STAGE=""
+  fi
   if [ "$RESTORE_RESTART" = 1 ]; then
     RESTORE_RESTART=0
     if ! stack_is_stopped; then
@@ -616,7 +712,7 @@ restore_cleanup() {
 }
 
 cmd_restore() {
-  local file=${1:-} data list sub
+  local file=${1:-} data list
   [ -n "$file" ] || die "Which backup? Say: myai restore <file>" "Your backups: ls -lh $APP_DIR/backups"
   if [ ! -f "$file" ] && [ -f "$APP_DIR/backups/$file" ]; then file="$APP_DIR/backups/$file"; fi
   [ -f "$file" ] || die "There is no file '$file'." "Your backups: ls -lh $APP_DIR/backups"
@@ -636,24 +732,32 @@ cmd_restore() {
 
   acquire_lock
   data=$(data_dir)
+  mkdir -p "$data"
+  trap myai_cleanup EXIT
+  RESTORE_DATA=$data
+  RESTORE_STAGE=$(mktemp -d "$data/.restore.XXXXXX") ||
+    die "Could not make a folder for unpacking the backup in $data." "Nothing was changed. Check the free disk space: df -h $data"
+  say "Unpacking the backup ..."
+  tar -xzpf "$file" -C "$RESTORE_STAGE" --anchored --exclude=data/models ||
+    die "The backup could not be unpacked." "Nothing was changed. Check the free disk space: df -h $data"
+
   say "Saving the current state ..."
-  make_backup
+  make_backup keep-all
   say "Saved as $BACKUP_FILE"
 
-  trap restore_cleanup EXIT
   RESTORE_RESTART=1
-  dc down --remove-orphans >/dev/null 2>&1 || die "Could not stop the services." "See: myai status"
-  for sub in webui agent workspace caddy; do
-    rm -rf -- "${data:?}/$sub"
-  done
-  mkdir -p "$data"
-  tar -xzpf "$file" -C "$APP_DIR" .env || die "The settings could not be restored from the backup." \
-    "Your state from before is in $BACKUP_FILE"
-  tar -xzpf "$file" -C "$data" --strip-components=1 --anchored --exclude=data/models data ||
-    die "The data could not be restored from the backup." "Your state from before is in $BACKUP_FILE"
-  chmod 600 "$ENV_FILE"
-  # The data belongs here, whatever folder the backup was made in.
+  dc down --remove-orphans >/dev/null 2>&1 || die "Could not stop the services." "Nothing was changed. See: myai status"
+  if ! { restore_swap "$data" "$RESTORE_STAGE" && restore_env_file "$RESTORE_STAGE"; }; then
+    die "The restore could not put the files of the backup in place." \
+      "The state from before is put back and the services are started again."
+  fi
+  # The data belongs here, whatever folder the backup was made in, and its
+  # folders need their owners: the agent cannot start in a folder it may not
+  # write to.
   env_set DATA_DIR "$data"
+  make_data_dirs "$data" >/dev/null ||
+    die "Could not give the data folders their owners." "The state from before is put back and the services are started again."
+  RESTORE_DONE=1
   if ! file_is_gguf "$(model_path)"; then
     RESTORE_RESTART=0
     warn "The backup uses a model file that is not on this server: $(model_path)"
@@ -764,7 +868,11 @@ doctor_address() {
     return 0
   fi
   if is_ipv4 "$site"; then
-    doc_ok "Address: the bare IP address $site (self-signed certificate)."
+    if tls_is_self_signed "$tls"; then
+      doc_ok "Address: the bare IP address $site (self-signed certificate)."
+    else
+      doc_ok "Address: the bare IP address $site."
+    fi
     return 0
   fi
   if ! command -v dig >/dev/null 2>&1; then
@@ -783,7 +891,7 @@ doctor_address() {
   else
     doc_ok "DNS: $site points to this server ($records)."
   fi
-  if [ -z "$tls" ]; then
+  if ! tls_is_self_signed "$tls"; then
     v6=$(dns_records AAAA "$site" | paste -sd' ' -) || v6=""
     if [ -n "$v6" ] && ! ip -6 -o addr show scope global 2>/dev/null | grep -qF -- "${v6%% *}"; then
       doc_look "$site also has an IPv6 address ($v6) that is not on this server." \
@@ -813,28 +921,42 @@ doctor_ports() {
 }
 
 doctor_https() {
-  local site tls code rc=0 end secs days
+  local site tls code rc=0 end secs days insecure="" advice=()
   site=$(env_get SITE_ADDRESS) || site=""
   tls=$(env_get CADDY_TLS_LINE) || tls=""
   [ -n "$site" ] || return 0
+  # Only a self-signed certificate is accepted without checking it; every
+  # other one must be valid, whichever certificate service issued it.
+  if tls_is_self_signed "$tls"; then insecure=-k; fi
   # Ask the proxy on this machine itself, under the public name.
   code=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' --resolve "$site:443:127.0.0.1" \
-    ${tls:+-k} "https://$site/" 2>/dev/null) || rc=$?
+    ${insecure:+"$insecure"} "https://$site/" 2>/dev/null) || rc=$?
   case "$rc" in
     0)
-      if [ -n "$tls" ]; then
+      if [ -n "$insecure" ]; then
         doc_ok "HTTPS answers (self-signed certificate, as configured)."
         return 0
       fi
       doc_ok "HTTPS answers with a valid certificate (status $code)."
       ;;
-    60)
-      doc_bad "The certificate for $site is not valid (yet)." \
-        "In the first minute after a start this is normal. Otherwise the cause is one of:" \
-        "- the name does not point to this server (see DNS above);" \
-        "- ports 80 and 443 are closed in your provider's firewall (Hostinger: hPanel, VPS, Security, Firewall);" \
-        "- for names ending in sslip.io: the shared weekly limit is used up. Use your own domain (--domain)." \
-        "What the proxy says: myai logs caddy"
+    35 | 60) # 35: no certificate to offer at all yet; 60: one that is not trusted
+      advice=("In the first minute after a start this is normal. Otherwise the cause is one of:"
+        "- The name does not point to this server (see DNS above)."
+        "- Ports 80 and 443 are closed in your provider's firewall (Hostinger: hPanel, VPS, Security, Firewall).")
+      if tls_contact "$tls" >/dev/null; then
+        advice+=("- The certificate services refused the contact address in CADDY_TLS_LINE. If the proxy's"
+          "  messages say so, empty that line in $ENV_FILE and run: myai restart caddy")
+      fi
+      case "$site" in
+        *.sslip.io)
+          advice+=("- The weekly limit that all names ending in sslip.io share is used up. Use your own domain (--domain).")
+          if [ -z "$tls" ]; then
+            advice+=("  Or let a second service (ZeroSSL) step in: give a real e-mail address of yours as the contact,"
+              "  CADDY_TLS_LINE='tls you@your-domain' in $ENV_FILE, then run: myai restart caddy")
+          fi
+          ;;
+      esac
+      doc_bad "The certificate for $site is not valid (yet)." "${advice[@]}" "What the proxy says: myai logs caddy"
       return 0
       ;;
     7)
@@ -1017,6 +1139,9 @@ main() {
       "Run the install command from the README; it keeps existing data."
   fi
   command -v docker >/dev/null 2>&1 || die "Docker is not installed." "Run the install command from the README again."
+  secure_env_file
+  # What other commands see while this one holds the lock.
+  MYAI_LOCK_NAME="myai $cmd"
 
   case "$cmd" in
     status) cmd_status ;;

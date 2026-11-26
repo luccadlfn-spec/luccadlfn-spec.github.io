@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 
 import httpx
+import pytest
 
+from app.llm import ContextOverflow, LLMError
 from app.loop import MALFORMED_NOTE
 from app.prompts import STEP_LIMIT_NOTE, SYSTEM_PROMPT
 from helpers import FakeLLM, _chunk, _usage, call, say, sse
@@ -176,6 +179,18 @@ async def test_empty_reply_while_thinking_is_retried_without_thinking(make_servi
     assert llm.requests[0]["messages"] == llm.requests[1]["messages"]
 
 
+async def test_thinking_that_fills_the_allowance_is_reported_once(make_services, caplog):
+    """A server that allows more thinking than the agent knows wastes that much on every call."""
+    llm = FakeLLM(say("", reasoning="hmm " * 50, finish="length"), say("One."),
+                  say("", reasoning="hmm " * 50, finish="length"), say("Two."))
+    sv = await make_services(llm, thinking="on")
+    with caplog.at_level(logging.WARNING, logger="app.loop"):
+        assert (await sv.agent.run_turn([], "first")).text == "One."
+        assert (await sv.agent.run_turn([], "second")).text == "Two."
+    warnings = [r.getMessage() for r in caplog.records if "LLM_THINK_BUDGET" in r.getMessage()]
+    assert len(warnings) == 1 and f"allowance of {sv.settings.think_tokens} tokens" in warnings[0]
+
+
 async def test_empty_reply_is_an_error(make_services):
     sv = await make_services(FakeLLM(say("")))
     result = await sv.agent.run_turn([], "x")
@@ -296,3 +311,36 @@ async def test_tool_call_fragments_are_assembled(make_services, tmp_path):
     sv = await make_services(FakeLLM(body, say("ok")))
     await sv.agent.run_turn([], "x")
     assert (tmp_path / "ws" / "f.txt").read_text() == "abc"
+
+
+_TOO_LONG = "request (17907 tokens) exceeds the available context size (16384 tokens), try increasing it"
+
+
+@pytest.mark.parametrize("response,expected", [
+    # The current llama-server: numbers as fields.
+    (httpx.Response(400, json={"error": {"code": 400, "message": _TOO_LONG, "type": "exceed_context_size_error",
+                                         "n_prompt_tokens": 17907, "n_ctx": 16384}}), (17907, 16384)),
+    # Numbers only in the message.
+    (httpx.Response(400, json={"error": {"code": 400, "message": _TOO_LONG, "type": "invalid_request_error"}}),
+     (17907, 16384)),
+    # Older servers: no numbers at all.
+    (httpx.Response(400, json={"error": {"code": 400, "type": "exceed_context_size_error",
+                                         "message": "the request exceeds the available context size, try increasing it"}}),
+     (None, None)),
+    # Reported inside an already started stream.
+    (sse({"error": {"code": 400, "message": _TOO_LONG, "type": "exceed_context_size_error"}}), (17907, 16384)),
+])
+async def test_a_context_overflow_is_recognised(make_services, response, expected):
+    sv = await make_services(FakeLLM(response))
+    with pytest.raises(ContextOverflow) as err:
+        await sv.llm.chat([{"role": "user", "content": "x"}], [], thinking=False, max_tokens=10)
+    assert (err.value.prompt_tokens, err.value.n_ctx) == expected
+    assert "context window" in str(err.value) and "try increasing" not in str(err.value)
+
+
+async def test_other_client_errors_are_not_mistaken_for_an_overflow(make_services):
+    sv = await make_services(FakeLLM(httpx.Response(400, json={"error": {"code": 400, "message": "bad grammar",
+                                                                         "type": "invalid_request_error"}})))
+    with pytest.raises(LLMError) as err:
+        await sv.llm.chat([{"role": "user", "content": "x"}], [], thinking=False, max_tokens=10)
+    assert not isinstance(err.value, ContextOverflow) and "bad grammar" in str(err.value)

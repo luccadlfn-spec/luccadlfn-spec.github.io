@@ -106,12 +106,33 @@ test_download_skips_a_file_that_is_already_complete() {
 
 test_download_size_mismatch_is_fatal() {
   hf_site
+  # Hugging Face does not say the size (its API is down), so only the
+  # downloaded file itself can be checked.
+  rm "$T/hf/api/models/$REPO/tree/main"
   load_installer
   expect_fail download_model "$REPO" "$FILE" $((SIZE + 1)) "$T/models"
   assert_contains "$OUT" "wrong size ($SIZE bytes, expected $((SIZE + 1)))"
   assert_contains "$OUT" "Run the same command again"
   assert_no_file "$T/models/$FILE"
   assert_no_file "$T/models/$FILE.part"
+}
+
+test_download_replaced_model_stops_before_downloading() {
+  hf_site
+  load_installer
+  # A partial download of the old upload, from an earlier try.
+  head -c 1000 "$(served_file)" >"$T/models/$FILE.part"
+  # The catalogue has the size of the file that the publisher has replaced.
+  expect_fail download_model "$REPO" "$FILE" $((SIZE - 1000)) "$T/models"
+  assert_contains "$OUT" "The publisher has replaced the model file $FILE: Hugging Face lists it with $SIZE bytes, the model list of myai with $((SIZE - 1000))."
+  assert_contains "$OUT" "nothing was downloaded"
+  # The installer's advice: myai does not exist yet during the first installation.
+  assert_contains "$OUT" "bash -s -- --model <id>"
+  assert_contains "$OUT" "hauhau heretic huihui classic fast"
+  assert_not_contains "$OUT" "myai model" "the installer's advice"
+  assert_not_contains "$(cat "$T/http.log")" "/resolve/main/" "requests for the file"
+  assert_no_file "$T/models/$FILE.part"
+  assert_no_file "$T/models/$FILE"
 }
 
 test_download_oversized_part_file_is_started_again() {
@@ -182,7 +203,9 @@ test_download_missing_file_stops_at_once() {
   load_installer
   expect_fail download_model "$REPO" "$FILE" 300004 "$T/models"
   assert_contains "$OUT" "the server answered 404"
-  assert_contains "$OUT" "myai model list"
+  # From the installer: the myai command does not exist yet at this point.
+  assert_contains "$OUT" "bash -s -- --model <id>"
+  assert_not_contains "$OUT" "myai model" "the installer's advice"
   assert_eq "$(grep -c "/resolve/main/" "$T/http.log")" 1 "number of tries for a missing file"
 }
 

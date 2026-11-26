@@ -8,6 +8,10 @@ Unlike `python -m http.server` it understands Range requests, which is what
 `curl -C -` sends to continue a download. Every request is appended to
 LOGFILE as "GET <path> range=<header or ->".
 
+A POST is answered with the file at its path, whatever the body was (a
+stand-in for an API that answers with fixed JSON); its log line also holds
+"x-api-key=<header or ->".
+
 A marker file makes one path misbehave once:
     <file>.flaky   the next GET sends half of the bytes and then drops the
                    connection (the marker is removed, so a retry works)
@@ -31,11 +35,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_HEAD(self):
         self.do_GET(head=True)
 
+    def do_POST(self):
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.do_GET()
+
     def do_GET(self, head=False):
         path = self.path.split("?", 1)[0]
         rng = self.headers.get("Range")
+        extra = ""
+        if self.command == "POST":
+            extra = " x-api-key=%s" % (self.headers.get("x-api-key") or "-")
         with open(LOG, "a") as log:
-            log.write("%s %s range=%s\n" % (self.command, path, rng or "-"))
+            log.write("%s %s range=%s%s\n" % (self.command, path, rng or "-", extra))
         full = os.path.normpath(os.path.join(ROOT, path.lstrip("/")))
         if not full.startswith(ROOT + os.sep) or not os.path.isfile(full):
             self.send_response(404)

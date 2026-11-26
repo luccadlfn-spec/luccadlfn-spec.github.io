@@ -172,16 +172,28 @@ def _decode(body: bytes, content_type: str) -> str:
     return body.decode("utf-8", "replace")
 
 
+# Bounded on purpose: with an open-ended pattern, a page full of "<title" openers and no
+# closer made one search take time quadratic in its size (about 27 s of CPU per fetch).
+_TITLE_OPEN = re.compile(r"<title\b[^>]{0,300}>", re.I)
+
+
+def page_title(text: str) -> str:
+    """The text of the first <title> element, found in linear time."""
+    m = _TITLE_OPEN.search(text, 0, 200_000)
+    if not m:
+        return ""
+    rest = text[m.end():m.end() + 2000]
+    end = rest.lower().find("</title")
+    return re.sub(r"\s+", " ", rest[:end]).strip()[:200] if end >= 0 else ""
+
+
 def extract_text(body: bytes, content_type: str, url: str) -> tuple[str, str]:
     """Return (title, readable text). Runs in a worker thread: parsing is CPU work."""
     mime = content_type.split(";", 1)[0].strip().lower()
     text = _decode(body, content_type)
     if "html" not in mime:
         return "", text
-    title = ""
-    m = re.search(r"<title[^>]*>(.*?)</title>", text[:200_000], re.I | re.S)
-    if m:
-        title = re.sub(r"\s+", " ", m.group(1)).strip()[:200]
+    title = page_title(text)
     extracted = None
     try:
         with warnings.catch_warnings():

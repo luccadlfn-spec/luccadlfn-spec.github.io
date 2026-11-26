@@ -28,6 +28,12 @@ class Scheduler:
         now = self._clock()
         queued = 0
         for sched in self.db.list_schedules():
+            if sched["kind"] == "once" and sched["next_run"] is None:
+                # A one-shot that has fired is kept until its run is over, so that a run cut
+                # off by a restart can be made again (ScheduleService.after_interruption).
+                if not self.db.schedule_has_open_task(sched["id"]):
+                    self.db.delete_schedule(sched["id"])
+                continue
             if not sched["enabled"] or sched["next_run"] is None or sched["next_run"] > now:
                 continue
             try:
@@ -52,10 +58,10 @@ class Scheduler:
                 log.warning("schedule %s: task queue is full, will retry", sched["id"])
                 return 0
         if sched["kind"] == "cron":
-            self.db.update_schedule(sched["id"], last_run=now,
-                                    next_run=next_cron_run(sched["cron"], self.s.tz, now))
+            self.db.update_schedule(sched["id"], last_run=now, next_run=next_cron_run(
+                sched["cron"], self.s.tz, now, previous=sched["next_run"]))
         elif fired:
-            self.db.delete_schedule(sched["id"])       # a one-shot has done its job
+            self.db.update_schedule(sched["id"], last_run=now, next_run=None)    # removed after its run
         else:
             self.db.update_schedule(sched["id"], next_run=now + 300)
         return fired

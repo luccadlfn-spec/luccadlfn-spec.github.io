@@ -103,6 +103,9 @@ services:
       AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-12}
       AGENT_CTX_TOKENS: ${AGENT_CTX_TOKENS:-14000}
       AGENT_MAX_OUTPUT_TOKENS: ${AGENT_MAX_OUTPUT_TOKENS:-1500}
+      # The model server's thinking budget (llm above): the agent leaves that
+      # much room for thinking, so a changed value must reach both.
+      LLM_THINK_BUDGET: ${LLM_THINK_BUDGET:-2048}
       CPU_GOVERNOR: ${CPU_GOVERNOR:-on}
       CPU_BASELINE: ${CPU_BASELINE:-0.60}
       BACKGROUND_REST_RATIO: ${BACKGROUND_REST_RATIO:-0.5}
@@ -151,22 +154,39 @@ services:
     networks:
       - sandbox_net
     healthcheck:
-      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8070/healthz', timeout=3)"]
+      # Plain bash, no Python: the probe shares the one CPU with whatever the
+      # agent runs and must stay cheap (a Python probe took 9-15 s while a
+      # snippet kept the CPU busy). Docker starts every probe with the
+      # container's environment, SANDBOX_TOKEN included, as the same user
+      # as the snippets; "env -i" drops it at once, so it is readable only for
+      # an instant. A token found that way is of no use: server.py refuses
+      # /exec requests made from inside the container.
+      test: ["CMD", "/usr/bin/env", "-i", "/bin/bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8070 && printf 'GET /healthz HTTP/1.0\\r\\n\\r\\n' >&3 && read -r status <&3 && [[ $$status == *' 200 '* ]]"]
       interval: 30s
-      timeout: 5s
-      retries: 3
+      timeout: 15s
+      retries: 5
       start_period: 10s
 
   # The web chat. Most of these settings are stored in Open WebUI's database
   # at the first start; later changes are made in its admin pages, not here.
-  # The image ships its own healthcheck.
   webui:
     <<: *common
     image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.5}
     depends_on:
       - agent
       - searxng
+    # The image's own test is kept; only its timing is set. The first start
+    # sets up the database and can take minutes on a slow CPU; without a start
+    # period it counts as unhealthy, and `myai heal` restarts unhealthy services.
+    healthcheck:
+      start_period: 5m
+      start_interval: 5s
     environment:
+      # Open WebUI keeps its state here (a bind mount, see volumes). Not its
+      # default /app/backend/data: the image keeps the embedding model there
+      # (under cache/), and a mount on that path would hide it, so the first
+      # start would try to download it again from Hugging Face.
+      DATA_DIR: /data
       # Model access: only through the agent service.
       ENABLE_OLLAMA_API: "false"
       ENABLE_OPENAI_API: "true"
@@ -208,7 +228,8 @@ services:
       WEB_SEARCH_RESULT_COUNT: "5"
       WEB_SEARCH_CONCURRENT_REQUESTS: "2"
       WEB_FETCH_MAX_CONTENT_LENGTH: "8000"
-      # Document search with the small embedding model that is in the image.
+      # Document search with the small embedding model that is in the image
+      # (under /app/backend/data/cache, which therefore stays unmounted).
       RAG_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
       RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
       # Nothing that phones home or runs code inside this container.
@@ -223,7 +244,8 @@ services:
       DATABASE_SQLITE_PRAGMA_CACHE_SIZE: "-2000"
       DATABASE_SQLITE_PRAGMA_MMAP_SIZE: "0"
     volumes:
-      - ${DATA_DIR:-./data}/webui:/app/backend/data
+      # The host's DATA_DIR (from .env), mounted at the container's DATA_DIR above.
+      - ${DATA_DIR:-./data}/webui:/data
     networks:
       - edge
       - search_net
@@ -241,7 +263,17 @@ services:
       # The image listens on "::" by default, which fails to start on a host
       # without IPv6. The Docker networks here are IPv4.
       GRANIAN_HOST: 0.0.0.0
+      # Wikipedia, Wikidata and OpenStreetMap refuse clients that name no
+      # contact, so SearXNG does not load those engines without one. SearXNG
+      # puts this value in the User-Agent of requests to about a dozen sites,
+      # so it is this server's address (which they see anyway), never the
+      # owner's e-mail.
+      SEARXNG_CONTACT_URL: https://${SITE_ADDRESS:?set SITE_ADDRESS in .env}/
     volumes:
+      # The image declares /etc/searxng a volume. Unnamed, Docker would make a
+      # new anonymous volume for every new container and leave the old one
+      # behind after each "docker compose down" (myai restore does one).
+      - searxng_config:/etc/searxng
       - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
       # Only a cache; safe to lose, so a named volume is fine here.
       - searxng_cache:/var/cache/searxng
@@ -308,3 +340,4 @@ networks:
 
 volumes:
   searxng_cache: {}
+  searxng_config: {}

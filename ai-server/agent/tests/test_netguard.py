@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import ipaddress
+import time
 
 import httpx
 import pytest
 
 from app.tools.base import ToolError
 from app.tools.netguard import Blocked, check_host_name, check_ip, resolve_public
-from app.tools.web import Fetcher, MAX_DOWNLOAD_BYTES, fetch_url
+from app.tools.web import Fetcher, MAX_DOWNLOAD_BYTES, extract_text, fetch_url, page_title
 
 BLOCKED_ADDRESSES = [
     "127.0.0.1", "127.8.9.1", "0.0.0.0", "0.1.2.3",                       # loopback, "this network"
@@ -224,3 +225,19 @@ async def test_fetch_result_respects_max_chars():
     text = await fetch_url(f, "http://public.example/long", 800)
     assert len(text) < 900 and "omitted" in text
     await f.aclose()
+
+
+def test_page_title():
+    assert page_title('<html><head><TITLE lang="en">  Quarterly\n  results </TITLE></head>') == "Quarterly results"
+    assert page_title("<html><head><titlebar>x</titlebar><title>Real</title>") == "Real"
+    assert page_title("<html><body>no title</body></html>") == ""
+    assert page_title("<title>never closed " + "x" * 5000) == ""
+
+
+@pytest.mark.parametrize("opener", ["<title>", "<title "])
+def test_a_hostile_page_costs_linear_time(opener):
+    """Many title openers and no closer once took seconds per 100 KB, in a thread the tool timeout cannot stop."""
+    body = ("<html><head>" + opener * (MAX_DOWNLOAD_BYTES // len(opener)))[:MAX_DOWNLOAD_BYTES].encode()
+    started = time.process_time()
+    title, _text = extract_text(body, "text/html; charset=utf-8", "https://public.example/")
+    assert title == "" and time.process_time() - started < 5.0      # was about 27 s

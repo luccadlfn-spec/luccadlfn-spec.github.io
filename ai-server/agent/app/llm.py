@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
@@ -27,6 +28,9 @@ MAX_TOOL_CALLS = 8
 
 DeltaFn = Callable[[str, str], None]          # ("content" | "reasoning", text)
 
+# llama-server: "request (17907 tokens) exceeds the available context size (16384 tokens), ..."
+_OVERFLOW_TEXT = re.compile(r"\((\d+) tokens\) exceeds the available context size \((\d+) tokens\)")
+
 
 class LLMError(Exception):
     """The model server answered with an error or the stream broke."""
@@ -38,6 +42,41 @@ class LLMError(Exception):
 
 class LLMUnavailable(LLMError):
     """The model server could not be reached, or was still loading, for the whole retry window."""
+
+
+class ContextOverflow(LLMError):
+    """The model server refused the prompt because it is larger than its context window.
+
+    It refuses before doing any work, and usually says how large the prompt really was.
+    """
+
+    def __init__(self, prompt_tokens: int | None, n_ctx: int | None):
+        self.prompt_tokens, self.n_ctx = prompt_tokens, n_ctx
+        size = f" ({prompt_tokens} tokens; the model takes at most {n_ctx})" if prompt_tokens and n_ctx else ""
+        super().__init__(f"this is too long for the model's context window{size}. "
+                         "Start a new conversation or send a shorter message", 400)
+
+
+def _overflow(err: Any) -> ContextOverflow | None:
+    """A ContextOverflow when an error object from the model server says the prompt was too long."""
+    if not isinstance(err, dict):
+        return None
+    message = str(err.get("message") or "")
+    if err.get("type") != "exceed_context_size_error" and "exceeds the available context size" not in message:
+        return None
+    n_prompt, n_ctx = err.get("n_prompt_tokens"), err.get("n_ctx")
+    if not (isinstance(n_prompt, int) and isinstance(n_ctx, int)):
+        m = _OVERFLOW_TEXT.search(message)
+        n_prompt, n_ctx = (int(m.group(1)), int(m.group(2))) if m else (None, None)
+    return ContextOverflow(n_prompt, n_ctx)
+
+
+def _error_object(body: bytes) -> Any:
+    try:
+        data = json.loads(body)
+    except ValueError:
+        return None
+    return data.get("error", data) if isinstance(data, dict) else None
 
 
 @dataclass
@@ -128,6 +167,9 @@ class LLMClient:
                     raw = (await resp.aread())[:4000]
                     if resp.status_code == 503:
                         raise _Retryable("503 loading")
+                    overflow = _overflow(_error_object(raw))
+                    if overflow is not None:
+                        raise overflow
                     raise LLMError(_error_text(raw, resp.status_code), resp.status_code)
                 async for line in resp.aiter_lines():
                     if not line.startswith("data:"):
@@ -143,6 +185,9 @@ class LLMClient:
                         continue
                     if "error" in chunk:
                         err = chunk["error"]
+                        overflow = _overflow(err)
+                        if overflow is not None:
+                            raise overflow
                         msg = err.get("message") if isinstance(err, dict) else err
                         raise LLMError(f"model server error: {str(msg)[:400]}")
                     self._usage(chunk, reply)

@@ -23,6 +23,7 @@ MAX_NOTE_CHARS = 2000
 MAX_MESSAGES_PER_CONVERSATION = 200
 KEEP_FINISHED_TASKS = 500
 MAX_RESULT_CHARS = 20_000
+INTERRUPTED = "interrupted by restart"
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -190,11 +191,17 @@ class Database:
                       (time.time(), task_id))
         return cur.rowcount > 0
 
-    def mark_interrupted(self) -> int:
-        """Tasks that were running when the process died cannot be resumed."""
-        cur = self._x("UPDATE tasks SET status='error', error='interrupted by restart', finished_at=?"
-                      " WHERE status='running'", (time.time(),))
-        return cur.rowcount
+    def mark_interrupted(self) -> list[dict[str, Any]]:
+        """Tasks that were running when the process stopped cannot be resumed. Returns them."""
+        with self._lock:
+            ids = [r["id"] for r in self._x("SELECT id FROM tasks WHERE status='running'").fetchall()]
+            self._x("UPDATE tasks SET status='error', error=?, finished_at=? WHERE status='running'",
+                    (INTERRUPTED, time.time()))
+            return [t for t in (self.get_task(i) for i in ids) if t is not None]
+
+    def count_interrupted(self, schedule_id: int) -> int:
+        return int(self._x("SELECT COUNT(*) AS n FROM tasks WHERE schedule_id=? AND error=?",
+                           (schedule_id, INTERRUPTED)).fetchone()["n"])
 
     def count_tasks(self, status: str) -> int:
         return int(self._x("SELECT COUNT(*) AS n FROM tasks WHERE status=?", (status,)).fetchone()["n"])

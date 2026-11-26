@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import re
 
+import httpx
 import pytest
 
-from app.auth import SESSION_COOKIE
+from app.api import create_app
+from app.auth import GLOBAL_FAILURES, GLOBAL_SPACING, SESSION_COOKIE
 from helpers import BEARER, PASSWORD, FakeLLM, say
 
 JSON = {"Content-Type": "application/json"}
@@ -75,7 +79,7 @@ async def test_wrong_password_and_tampered_cookies(make_services, client_for):
         c.cookies.clear()
         expiry, nonce, sig = good.split(".")
         forged = [f"{int(expiry) + 999}.{nonce}.{sig}", f"{expiry}.{nonce}.{'0' * len(sig)}", "garbage", "", "1.2.3",
-                  f"{expiry}.{nonce}.{sig}é"]
+                  f"{expiry}.{nonce}.{sig}é", "\u00b2\u00b2.ab.cd", "9" * 40 + ".ab.cd"]   # "²" passes isdigit()
         for value in forged:
             r = await c.get("/agent/api/status", headers={"Cookie": f"{SESSION_COOKIE}={value}".encode("latin-1")})
             assert r.status_code == 401, value
@@ -99,8 +103,14 @@ async def test_sessions_expire_and_logout_revokes(make_services, client_for):
         assert (await c.get("/agent/api/status", headers=other_device)).status_code == 401
 
 
+def client_at(sv, address: str) -> httpx.AsyncClient:
+    """A client whose TCP connection comes from `address` (as the agent sees it)."""
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=create_app(sv), client=(address, 40000)),
+                             base_url="https://agent.test")
+
+
 async def test_login_rate_limit_per_client(make_services, client_for):
-    sv = await make_services()
+    sv = await make_services(trusted_proxies=("127.0.0.1",))      # the test client plays the reverse proxy
     now = {"t": 1000.0}
     sv.auth._clock = lambda: now["t"]
     attacker, owner = {"X-Forwarded-For": "203.0.113.50"}, {"X-Forwarded-For": "198.51.100.7"}
@@ -116,14 +126,80 @@ async def test_login_rate_limit_per_client(make_services, client_for):
         assert (await login(c, PASSWORD, headers=attacker)).status_code == 200     # the window passed
 
 
-async def test_login_rate_limit_overall_cap_when_addresses_are_forged(make_services, client_for):
+async def test_attempts_sent_at_the_same_moment_are_all_counted(make_services, client_for):
     sv = await make_services()
+
+    async def late_body(i: int):
+        await asyncio.sleep(0.05)               # every request is in the handler before any body arrives
+        yield json.dumps({"password": f"guess {i}"}).encode()
+
     async with client_for(sv) as c:
-        for i in range(30):
+        answers = await asyncio.gather(*[c.post("/agent/api/login", content=late_body(i), headers=JSON)
+                                         for i in range(20)])
+    codes = [r.status_code for r in answers]
+    assert codes.count(401) == 5 and codes.count(429) == 15     # five guesses, not twenty
+
+
+async def test_only_the_reverse_proxy_may_name_the_client(make_services):
+    """Another container (the sandbox runs model-written code) cannot pick a new name per guess."""
+    sv = await make_services(trusted_proxies=("10.1.0.2",))
+    async with client_at(sv, "10.9.0.5") as sandbox, client_at(sv, "10.1.0.2") as caddy:
+        for i in range(5):
+            r = await login(sandbox, "guess", headers={"X-Forwarded-For": f"203.0.113.{i}"})
+            assert r.status_code == 401
+        r = await login(sandbox, "guess", headers={"X-Forwarded-For": "203.0.113.99"})
+        assert r.status_code == 429                                         # all counted against 10.9.0.5
+        r = await login(caddy, PASSWORD, headers={"X-Forwarded-For": "198.51.100.7"})
+        assert r.status_code == 200                                         # the owner, through the proxy
+
+
+async def test_ipv6_clients_are_grouped_by_their_64_bit_prefix(make_services, client_for):
+    sv = await make_services(trusted_proxies=("127.0.0.1",))
+    async with client_for(sv) as c:
+        for i in range(1, 6):
+            r = await login(c, "guess", headers={"X-Forwarded-For": f"2001:db8:1:2::{i:x}"})
+            assert r.status_code == 401
+        r = await login(c, "guess", headers={"X-Forwarded-For": "2001:db8:1:2:aaaa::1"})
+        assert r.status_code == 429                                         # same /64: same client
+        r = await login(c, PASSWORD, headers={"X-Forwarded-For": "2001:db8:1:3::1"})
+        assert r.status_code == 200                                         # another /64
+
+
+async def test_many_failures_slow_logins_down_but_never_lock_the_owner_out(make_services, client_for):
+    sv = await make_services(trusted_proxies=("127.0.0.1",))
+    now = {"t": 1000.0}
+    sv.auth._clock = lambda: now["t"]
+    async with client_for(sv) as c:
+        for i in range(GLOBAL_FAILURES):                    # guesses spread over many addresses
             r = await login(c, "guess", headers={"X-Forwarded-For": f"203.0.113.{i}"})
             assert r.status_code == 401
-        r = await login(c, PASSWORD, headers={"X-Forwarded-For": "203.0.113.200"})
-    assert r.status_code == 429
+        # Above the overall cap, attempts from anywhere are spaced out ...
+        assert (await login(c, "guess", headers={"X-Forwarded-For": "203.0.113.100"})).status_code == 401
+        r = await login(c, "guess", headers={"X-Forwarded-For": "203.0.113.101"})
+        assert r.status_code == 429 and 1 <= int(r.headers["retry-after"]) <= GLOBAL_SPACING
+        r = await login(c, PASSWORD, headers={"X-Forwarded-For": "198.51.100.7"})
+        assert r.status_code == 429
+        # ... but the owner gets in after a few seconds instead of being locked out.
+        now["t"] += GLOBAL_SPACING
+        assert (await login(c, PASSWORD, headers={"X-Forwarded-For": "198.51.100.7"})).status_code == 200
+
+
+async def test_the_proxy_address_is_looked_up_again_when_its_container_changes():
+    from app.auth import PROXY_REFRESH, ProxyTrust
+    answers = [{"10.1.0.2"}, {"10.1.0.7"}]
+    clock = {"t": 0.0}
+
+    async def resolve(name):
+        assert name == "caddy"
+        return answers[0]
+
+    trust = ProxyTrust(("caddy",), resolve=resolve, clock=lambda: clock["t"])
+    assert await trust.is_proxy("10.1.0.2") and not await trust.is_proxy("10.9.0.5")
+    answers.pop(0)                                          # caddy was recreated with a new address
+    assert not await trust.is_proxy("10.1.0.7")             # looked up a moment ago: not again yet
+    clock["t"] += PROXY_REFRESH
+    assert await trust.is_proxy("10.1.0.7") and not await trust.is_proxy("10.1.0.2")
+    assert not await ProxyTrust(()).is_proxy("10.1.0.2")
 
 
 async def test_password_login_is_disabled_when_no_password_is_set(make_services, client_for):
@@ -174,6 +250,17 @@ async def test_every_api_route_requires_auth(make_services, client_for, method, 
         r = await c.request(method, path, headers=JSON, content=b"{}" if method != "GET" else None)
         wrong = await c.request(method, path, headers={**JSON, "Authorization": "Bearer nope"})
     assert r.status_code == 401 and wrong.status_code == 401 and r.json() == {"error": "not signed in"}
+
+
+@pytest.mark.parametrize("method,path", [
+    ("GET", "/agent/api/tasks/99999999999999999999"), ("POST", "/agent/api/tasks/99999999999999999999/cancel"),
+    ("PATCH", "/agent/api/schedules/99999999999999999999"), ("DELETE", "/agent/api/schedules/99999999999999999999"),
+    ("DELETE", "/agent/api/notes/99999999999999999999"), ("GET", "/agent/api/tasks/0"), ("GET", "/agent/api/tasks/-5")])
+async def test_ids_out_of_range_are_bad_requests_not_crashes(make_services, client_for, method, path):
+    sv = await make_services()
+    async with client_for(sv) as c:
+        r = await c.request(method, path, headers=BEARER, json={"enabled": True})
+    assert r.status_code == 400 and r.json() == {"error": "invalid request parameters"}
 
 
 async def test_tasks_api(make_services, client_for):

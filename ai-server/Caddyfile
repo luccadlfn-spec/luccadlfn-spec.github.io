@@ -6,9 +6,18 @@
 # touches Open WebUI or the agent. The apps keep their own logins on top.
 #
 # Values come from the container environment (see docker-compose.yml):
-#   SITE_ADDRESS    host name only, for example srv123456.hstgr.cloud
+#   SITE_ADDRESS    host name (for example srv123456.hstgr.cloud), or an IP address with "tls internal"
 #   GATE_TOKEN      letters and digits only (the installer writes 32 hex characters)
-#   CADDY_TLS_LINE  empty = certificate from Let's Encrypt; "tls internal" = self-signed
+#   CADDY_TLS_LINE  empty = certificate from Let's Encrypt; "tls internal" = self-signed;
+#                   "tls <your e-mail>" = Let's Encrypt, then ZeroSSL if that fails
+#
+# Certificate authorities: with CADDY_TLS_LINE empty, Let's Encrypt is the only
+# one Caddy uses. Caddy's usual second choice, ZeroSSL, needs an account e-mail
+# address (Caddy says "your email address is required to use ZeroSSL's ACME
+# endpoint"), so it is off until CADDY_TLS_LINE names a real address. Names
+# ending in sslip.io share one weekly Let's Encrypt limit with every other
+# sslip.io user; when it is used up, the certificate waits until it frees up,
+# unless ZeroSSL is enabled this way.
 #
 # Do not add basic_auth: Open WebUI uses the Authorization header itself.
 # Do not add a log directive: the entry URL contains the token.
@@ -18,6 +27,11 @@
 	# Only matters with "tls internal": nothing inside this container needs
 	# to trust the self-signed CA.
 	skip_install_trust
+
+	# Clients send no server name (SNI) when they connect to an IP address.
+	# Without a default, Caddy then finds no certificate (it would look one up
+	# by the container's own address) and every handshake fails.
+	default_sni {$SITE_ADDRESS}
 
 	# Port 80 only redirects (the http:// block below does it for every host
 	# name, so Caddy's own per-site redirect is not needed). Certificates are

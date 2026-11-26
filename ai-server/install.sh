@@ -34,7 +34,10 @@ SITE_ADDRESS=""
 SITE_REASON=""
 CADDY_TLS_LINE=""
 PUBLIC_IPV4=""
-OLD_LLAMA_IMAGE=""
+LLAMA_UPDATE_TAG="" # with --update: the tag whose newer build is tried
+LLAMA_TRY=""        # the model server build this run tries (repo@sha256:...)
+REPLACED_LLAMA=""   # the build that a newer one replaced
+REPLACED_IMAGES=()  # image versions that this update replaced
 HARDEN_FAILED=()
 # -g: also global when this file is sourced from inside a function (the tests).
 declare -gA PLAN=()
@@ -50,8 +53,11 @@ Options:
                          (default: worked out automatically)
   --model <id>           model to install: hauhau, heretic, huihui, classic or fast
                          (default: chosen by how much memory the server has)
-  --admin-email <e>      your login name for the chat page
-                         (default: owner@example.com; no e-mail is ever sent)
+  --admin-email <e>      your login name for the chat page (default: owner@example.com).
+                         A real address is also the contact for this server's
+                         HTTPS certificate at Let's Encrypt and ZeroSSL, so that
+                         the second can step in when the first fails.
+                         myai itself never sends e-mail.
   --governor <on|off>    protect the CPU credits of a Hostinger server
                          (default: on when this is a Hostinger server)
   --tls-internal         use a self-signed certificate (for testing)
@@ -184,7 +190,7 @@ prescan() {
 }
 
 parse_args() {
-  local arg args=()
+  local arg args=() ids
   OPT_DOMAIN=${MYAI_DOMAIN:-}
   OPT_MODEL=${MYAI_MODEL:-}
   OPT_ADMIN_EMAIL=${MYAI_ADMIN_EMAIL:-}
@@ -274,10 +280,17 @@ parse_args() {
   fi
   # With --update the hardening of the first install is left as it is.
   if [ "$OPT_UPDATE" = 1 ]; then OPT_NO_HARDEN=1; fi
+  # How other myai commands name this run while it holds the lock. They wait
+  # for an update, but not for an installation, which can take an hour.
+  if [ "$OPT_UPDATE" = 1 ]; then MYAI_LOCK_NAME="myai update"; else MYAI_LOCK_NAME="the installer"; fi
 
   ENV_FILE="$APP_DIR/.env"
   MODELS_CONF="$SRC_DIR/config/models.conf"
   LOG_FILE="$MYAI_SYSROOT/var/log/myai-install.log"
+  # Advice when a model cannot be downloaded. The myai command that the
+  # library suggests does not exist yet during the first installation.
+  ids=$(catalog_ids | paste -sd' ' -) || ids=""
+  MODEL_CHOICE_HINT="Choose another model (${ids:-see config/models.conf}) and run the install command again with it at the end:  ... | bash -s -- --model <id>"
 }
 
 option_example() {
@@ -306,11 +319,23 @@ on_exit() {
       ;;
   esac
   if [ "$rc" -eq 0 ]; then return 0; fi
-  if [ "${MYAI_DIE_SHOWN:-0}" != 1 ]; then
-    printf '\nStopped: something failed during step %s (%s).\n' "$STEP_NO" "$STEP_NAME" >&2
-    if [ -n "$FAILED_AT" ]; then printf '  The command that failed: %s\n' "$FAILED_AT" >&2; fi
-  fi
-  printf '  Nothing you already have is lost. After fixing the problem, run the same command again;\n' >&2
+  case "$rc" in
+    129 | 130 | 143) # the terminal closed, Ctrl+C, or stopped from outside: nothing failed
+      if [ "$rc" = 129 ]; then
+        printf '\nStopped in step [%s/%s] %s: the terminal was closed.\n' "$STEP_NO" "$STEP_TOTAL" "$STEP_NAME" >&2
+      else
+        printf '\nStopped as asked, in step [%s/%s] %s.\n' "$STEP_NO" "$STEP_TOTAL" "$STEP_NAME" >&2
+      fi
+      printf '  Nothing you already have is lost. To go on, run the same command again;\n' >&2
+      ;;
+    *)
+      if [ "${MYAI_DIE_SHOWN:-0}" != 1 ]; then
+        printf '\nStopped: something failed in step [%s/%s] %s.\n' "$STEP_NO" "$STEP_TOTAL" "$STEP_NAME" >&2
+        if [ -n "$FAILED_AT" ]; then printf '  The command that failed: %s\n' "$FAILED_AT" >&2; fi
+      fi
+      printf '  Nothing you already have is lost. After fixing the problem, run the same command again;\n' >&2
+      ;;
+  esac
   printf '  finished steps are quick the second time.\n' >&2
 }
 
@@ -503,6 +528,16 @@ check_disk() {
   fi
 }
 
+# Adds a line to the advice of check_ports unless it is there already: one
+# program usually holds both ports.
+add_advice() {
+  local line
+  for line in ${advice[@]+"${advice[@]}"}; do
+    if [ "$line" = "$1" ]; then return 0; fi
+  done
+  advice+=("$1")
+}
+
 check_ports() {
   local spec proto port users holder busy=() advice=() traefik=0 unit
   if ! command -v ss >/dev/null 2>&1; then
@@ -521,12 +556,12 @@ check_ports() {
       case "${holder,,}" in
         *traefik*) traefik=1 ;;
       esac
-      advice+=("  docker stop ${holder%% *} && docker update --restart=no ${holder%% *}")
+      add_advice "  docker stop ${holder%% *} && docker update --restart=no ${holder%% *}"
     else
       busy+=("Port $port ($proto) is used by the program: $users")
       for unit in nginx apache2 caddy lighttpd haproxy; do
         case " $users " in
-          *" $unit "*) advice+=("  systemctl disable --now $unit") ;;
+          *" $unit "*) add_advice "  systemctl disable --now $unit" ;;
         esac
       done
     fi
@@ -546,9 +581,23 @@ check_ports() {
   problem "Ports 80 and 443 must be free." "${busy[@]}" "${advice[@]}" "Then run the installer again."
 }
 
+# Two installers at the same time would replace each other's files (the
+# Hostinger post-install script can still be working when the install
+# command is pasted into the browser terminal as well).
+check_not_installing() {
+  if ! lock_is_held; then return 0; fi
+  read_lock_holder
+  if [ "$LOCK_WHAT" = "the installer" ]; then
+    problem "The installer is already running (process $LOCK_PID, since $LOCK_SINCE)." \
+      "Wait until it has finished; there is no need to start it twice." \
+      "If the Hostinger post-install script started it, watch it with: tail -f /root/myai-install.log"
+  fi
+}
+
 preflight() {
   PREFLIGHT_PROBLEMS=0
   check_root
+  check_not_installing
   check_os
   check_cpu
   check_memory
@@ -567,8 +616,9 @@ collect_answers() {
   if [ -n "$ADMIN_EMAIL" ] || env_has WEBUI_ADMIN_EMAIL; then return 0; fi
   ADMIN_EMAIL="owner@example.com"
   if ! can_ask; then return 0; fi
-  printf '\n  One question. Your answer is only the login name for the chat page;\n' >/dev/tty
-  printf '  no e-mail is ever sent to it.\n' >/dev/tty
+  printf '\n  One question. Your answer is the login name for the chat page. A real\n' >/dev/tty
+  printf "  address is also given to Let's Encrypt and ZeroSSL, the free services that\n" >/dev/tty
+  printf '  issue the HTTPS certificate, as its contact. myai itself never sends e-mail.\n' >/dev/tty
   while [ "$tries" -lt 3 ]; do
     tries=$((tries + 1))
     answer=$(ask "  E-mail address for your login (press Enter for owner@example.com): " "owner@example.com")
@@ -628,6 +678,7 @@ install_packages() {
   fi
   # The QR code is a convenience; go on without it.
   if ! command -v qrencode >/dev/null 2>&1; then
+    note "Installing qrencode, which shows your entry link as a QR code."
     apt_install qrencode || warn "The QR code tool could not be installed. The link is still shown as text."
   fi
 }
@@ -928,9 +979,14 @@ install_app_files() {
   for sub in agent sandbox; do
     if [ -d "$src/$sub" ]; then rm -rf "${dst:?}/$sub"; fi
   done
+  # --mode: every file readable by all, whatever the umask of the copy it
+  # comes from. The services read these files as other users (the agent and
+  # the sandbox as 10001, SearXNG its settings as 977), and the archive's
+  # "./" entry would otherwise give $dst the mode of a 700 download folder.
   tar -C "$src" --anchored --exclude=./.env --exclude=./data --exclude=./backups --exclude=./.git \
-    --exclude=./.lock --exclude=./.stopped \
-    --no-anchored --exclude=__pycache__ --exclude=.pytest_cache -cf - . |
+    --exclude=./.lock --exclude=./.stopped --exclude=./.replaced-images \
+    --no-anchored --exclude=__pycache__ --exclude=.pytest_cache \
+    --mode=u+rwX,go+rX,go-w -cf - . |
     tar -C "$dst" --no-same-owner -xf -
   chmod 755 "$dst/bin/myai" "$dst/install.sh"
   note "App files copied to $dst."
@@ -985,28 +1041,43 @@ new_pairing_code() {
   printf '%08d\n' $((16#$hex % 100000000))
 }
 
+# The login e-mail of the chat page, as this run sets it.
+admin_email_now() {
+  local e=${PLAN[WEBUI_ADMIN_EMAIL]:-${ADMIN_EMAIL:-}}
+  if [ -z "$e" ]; then e=$(env_get WEBUI_ADMIN_EMAIL) || e=""; fi
+  printf '%s\n' "${e:-owner@example.com}"
+}
+
+# CADDY_TLS_LINE for a public name. With a real e-mail address as the
+# contact, Caddy can also use ZeroSSL when Let's Encrypt fails; that matters
+# most for names ending in sslip.io, which share one weekly Let's Encrypt
+# limit with every other sslip.io user. A placeholder address would make
+# Let's Encrypt refuse to issue anything, so then the line stays empty.
+public_tls_line() { # EMAIL
+  if usable_contact_email "$1"; then printf 'tls %s\n' "$1"; fi
+}
+
 # Sets SITE_ADDRESS, CADDY_TLS_LINE and SITE_REASON:
 #   1. --domain;
 #   2. the machine's own full name, when public DNS points it at this machine;
 #   3. <public address with dashes>.sslip.io, a free name for any address;
 #   4. localhost with a self-signed certificate when there is no public address.
 choose_site_address() {
-  local fqdn
-  CADDY_TLS_LINE=""
+  local fqdn self_signed=0
   PUBLIC_IPV4=$(detect_public_ipv4) || PUBLIC_IPV4=""
   if [ -n "$OPT_DOMAIN" ]; then
     SITE_ADDRESS=$OPT_DOMAIN
     SITE_REASON="given with --domain"
     if [ "$SITE_ADDRESS" = localhost ] || is_ipv4 "$SITE_ADDRESS"; then
       # No public certificate authority signs these.
-      CADDY_TLS_LINE="tls internal"
+      self_signed=1
     elif [ -n "$PUBLIC_IPV4" ] && ! dns_points_to "$SITE_ADDRESS" "$PUBLIC_IPV4"; then
       warn "$SITE_ADDRESS does not point to this server yet (its public address is $PUBLIC_IPV4)."
       warn "Create an A record for it at your domain provider; the certificate is issued once that works."
     fi
   elif [ -z "$PUBLIC_IPV4" ]; then
     SITE_ADDRESS=localhost
-    CADDY_TLS_LINE="tls internal"
+    self_signed=1
     SITE_REASON="no public address was found, so only this machine can reach it"
   else
     fqdn=$(machine_fqdn)
@@ -1015,10 +1086,15 @@ choose_site_address() {
       SITE_REASON="the name of this server, which public DNS points here"
     else
       SITE_ADDRESS="${PUBLIC_IPV4//./-}.sslip.io"
-      SITE_REASON="a free name for the address $PUBLIC_IPV4"
+      SITE_REASON="a free name from sslip.io that leads to this server's address $PUBLIC_IPV4"
     fi
   fi
-  if [ "$OPT_TLS_INTERNAL" = 1 ]; then CADDY_TLS_LINE="tls internal"; fi
+  if [ "$OPT_TLS_INTERNAL" = 1 ]; then self_signed=1; fi
+  if [ "$self_signed" = 1 ]; then
+    CADDY_TLS_LINE="tls internal"
+  else
+    CADDY_TLS_LINE=$(public_tls_line "$(admin_email_now)")
+  fi
   SITE_CHOSEN=1
 }
 
@@ -1142,6 +1218,14 @@ new_env_value() {
   esac
 }
 
+# True once Open WebUI has its database, and with it the first login: it
+# reads WEBUI_ADMIN_EMAIL and WEBUI_ADMIN_PASSWORD only before that.
+chat_has_its_login() {
+  local data=${PLAN[DATA_DIR]:-}
+  if [ -z "$data" ]; then data=$(env_get DATA_DIR) || data="$APP_DIR/data"; fi
+  [ -f "$data/webui/webui.db" ]
+}
+
 # Change one setting that was asked for on the command line.
 override_setting() { # KEY VALUE
   if [ "${PLAN[$1]:-}" = "$2" ]; then return 0; fi
@@ -1154,7 +1238,11 @@ override_setting() { # KEY VALUE
 # added, and only options given on the command line change a value.
 write_config() {
   local line key tmpl quoted existing=0 content="" shown="" added="" added_shown="" extra
-  [ -f "$ENV_FILE" ] && existing=1
+  local email_changed=0 tls contact
+  if [ -f "$ENV_FILE" ]; then
+    existing=1
+    secure_env_file
+  fi
   PLAN=()
 
   while IFS= read -r line; do
@@ -1223,27 +1311,50 @@ write_config() {
 
   # Options given on the command line win over what the file says.
   if [ "$existing" = 1 ]; then
+    if [ -n "$OPT_ADMIN_EMAIL" ] && [ "${PLAN[WEBUI_ADMIN_EMAIL]:-}" != "$OPT_ADMIN_EMAIL" ]; then
+      if chat_has_its_login; then
+        # Open WebUI reads the setting only while it has no database. The
+        # credentials sheet shows this value, so it must stay the login
+        # that really works.
+        warn "The chat page already has its login, ${PLAN[WEBUI_ADMIN_EMAIL]:-?}. --admin-email cannot change it any more, so it stays."
+        warn "To change the login: log in to the chat page, open the Admin Panel, Users, and edit your user."
+      else
+        override_setting WEBUI_ADMIN_EMAIL "$OPT_ADMIN_EMAIL"
+        email_changed=1
+      fi
+    fi
     if [ -n "$OPT_DOMAIN" ]; then
       ensure_site
       override_setting SITE_ADDRESS "$SITE_ADDRESS"
-      override_setting CADDY_TLS_LINE "$CADDY_TLS_LINE"
+      # The new address gets the certificate it needs, but a contact address
+      # chosen before stays.
+      if tls_is_self_signed "$CADDY_TLS_LINE" || ! tls_contact "${PLAN[CADDY_TLS_LINE]:-}" >/dev/null; then
+        override_setting CADDY_TLS_LINE "$CADDY_TLS_LINE"
+      fi
     elif [ "$OPT_TLS_INTERNAL" = 1 ]; then
       override_setting CADDY_TLS_LINE "tls internal"
+    elif [ "$email_changed" = 1 ] &&
+      { [ -z "${PLAN[CADDY_TLS_LINE]:-}" ] || tls_contact "${PLAN[CADDY_TLS_LINE]}" >/dev/null; }; then
+      # The contact for the certificate follows the login address.
+      override_setting CADDY_TLS_LINE "$(public_tls_line "$OPT_ADMIN_EMAIL")"
     fi
     if [ -n "$OPT_MODEL" ] && [ -n "$MODEL_FILE" ]; then
       override_setting MODEL_ID "$MODEL_ID"
       override_setting MODEL_FILE "$MODEL_FILE"
     fi
     if [ -n "$OPT_GOVERNOR" ]; then override_setting CPU_GOVERNOR "$OPT_GOVERNOR"; fi
-    if [ -n "$OPT_ADMIN_EMAIL" ] && [ "${PLAN[WEBUI_ADMIN_EMAIL]}" != "$OPT_ADMIN_EMAIL" ]; then
-      override_setting WEBUI_ADMIN_EMAIL "$OPT_ADMIN_EMAIL"
-      warn "The chat page only reads the admin e-mail when it starts for the very first time. To change an existing login, use the chat page's own settings."
-    fi
   fi
 
   note "Address: ${PLAN[SITE_ADDRESS]}${SITE_REASON:+ ($SITE_REASON)}"
-  if [ -n "${PLAN[CADDY_TLS_LINE]}" ]; then
+  tls=${PLAN[CADDY_TLS_LINE]:-}
+  if tls_is_self_signed "$tls"; then
     note "Certificate: self-signed (browsers show a warning the first time)"
+  elif contact=$(tls_contact "$tls"); then
+    note "Certificate: from Let's Encrypt, or ZeroSSL when that fails (contact address: $contact)"
+  elif [ -z "$tls" ]; then
+    note "Certificate: from Let's Encrypt"
+  else
+    note "Certificate: as set in CADDY_TLS_LINE ($tls)"
   fi
   note "Threads: ${PLAN[LLM_THREADS]} for writing answers, ${PLAN[LLM_THREADS_BATCH]} for reading prompts ($VCPUS vCPUs)"
   note "CPU-credit protection (governor): ${PLAN[CPU_GOVERNOR]}"
@@ -1259,7 +1370,7 @@ check_plan() {
   fi
   # A name with an IPv6 record that leads elsewhere makes the certificate fail.
   site=${PLAN[SITE_ADDRESS]:-}
-  if [ -z "${PLAN[CADDY_TLS_LINE]:-}" ] && [ -n "$site" ] && command -v dig >/dev/null 2>&1; then
+  if ! tls_is_self_signed "${PLAN[CADDY_TLS_LINE]:-}" && [ -n "$site" ] && command -v dig >/dev/null 2>&1; then
     records=$(dns_records AAAA "$site" | paste -sd' ' -) || records=""
     if [ -n "$records" ] && ! ip -6 -o addr show scope global 2>/dev/null | grep -qF -- "${records%% *}"; then
       warn "$site also has an IPv6 address ($records) that is not on this server. The certificate may fail until that DNS record (type AAAA) is removed or corrected."
@@ -1267,9 +1378,20 @@ check_plan() {
   fi
 }
 
+# An image version that an update replaced. It is also written down in the
+# app folder, so that an update which stops half-way (and leaves the new
+# version in the settings) still gets it removed by the next run that works.
+remember_replaced_image() { # IMAGE
+  REPLACED_IMAGES+=("$1")
+  if [ "$DRY_RUN" != 1 ]; then printf '%s\n' "$1" >>"$APP_DIR/.replaced-images"; fi
+}
+
 # With --update, the images follow the versions the new app files were
-# tested with. The model server image is a moving tag: the old exact build is
-# remembered so that start_stack can go back to it.
+# tested with. Open WebUI, SearXNG and Caddy have fixed versions, which the
+# settings take at once; the replaced versions are removed once the update
+# has worked. The model server image is a moving tag instead: its newer
+# build is only tried (start_llm), and the settings keep the build that
+# worked until the newer one has loaded the model.
 refresh_images() {
   local key new
   [ "$OPT_UPDATE" = 1 ] || return 0
@@ -1278,24 +1400,25 @@ refresh_images() {
     new=$(env_get "$key" "$SRC_DIR/.env.example") || continue
     if [ -n "$new" ] && [ "${PLAN[$key]:-}" != "$new" ]; then
       note "$key: ${PLAN[$key]:-(not set)} -> $new"
+      if [ -n "${PLAN[$key]:-}" ]; then remember_replaced_image "${PLAN[$key]}"; fi
       override_setting "$key" "$new"
     fi
   done
   new=$(env_get LLAMA_IMAGE "$SRC_DIR/.env.example") || new=""
   case "${PLAN[LLAMA_IMAGE]:-}" in
-    *@sha256:*)
-      if [ -n "$new" ]; then
-        OLD_LLAMA_IMAGE=${PLAN[LLAMA_IMAGE]}
-        override_setting LLAMA_IMAGE "$new"
-      fi
-      ;;
+    *@sha256:*) LLAMA_UPDATE_TAG=$new ;;
   esac
 }
 
 configure() {
+  # The lock comes first: another installer, an update or a backup may be
+  # using the app files that are replaced next. From here on the 5-minute
+  # repair and other myai commands wait for this run.
+  if [ "$DRY_RUN" != 1 ]; then
+    mkdir -p "$APP_DIR"
+    acquire_lock
+  fi
   install_app_files
-  # From here on the 5-minute repair timer and other myai commands wait.
-  if [ "$DRY_RUN" != 1 ]; then acquire_lock; fi
   install_cli
   write_config
   refresh_images
@@ -1305,11 +1428,7 @@ configure() {
 
 make_dirs() {
   local data=${PLAN[DATA_DIR]}
-  # Model files and the web data belong to root; the agent and the sandbox
-  # run as user 10001 and share the workspace.
-  run install -d -m 755 -o root -g root "$data" "$data/models" "$data/webui" \
-    "$data/caddy" "$data/caddy/data" "$data/caddy/config"
-  run install -d -m 750 -o 10001 -g 10001 "$data/agent" "$data/workspace"
+  make_data_dirs "$data"
   run install -d -m 700 -o root -g root "$APP_DIR/backups"
   note "Data folder: $data"
 }
@@ -1326,7 +1445,7 @@ fetch_model() {
     repo=$(catalog_field "$id" 3)
     bytes=$(catalog_field "$id" 5)
     download_model "$repo" "$file" "$bytes" "$dir"
-  elif [ "$DRY_RUN" != 1 ] && file_is_gguf "$dir/$file"; then
+  elif file_is_gguf "$dir/$file"; then
     note "Using your own model file: $dir/$file"
   else
     warn "The model file $file is not in the catalogue, so it cannot be downloaded here."
@@ -1336,23 +1455,37 @@ fetch_model() {
 
 # ---------------------------------------------------------- step 8: start ---
 
-# Replace the moving image tag by the exact build that was just pulled, so
-# that later restarts keep using the build that was tested here.
-pin_llama_image() {
-  local image=${PLAN[LLAMA_IMAGE]} pinned
-  case "$image" in
-    *@sha256:*) return 0 ;;
+# Sets LLAMA_TRY to the exact model server build (repo@sha256:...) that this
+# run tries, or to "" when it keeps the one in the settings. That is the
+# build behind the moving tag on a first installation, and the newer build
+# of the new app files' tag with --update. Restarts later stay on the build
+# that was tested here.
+pick_llama_build() {
+  local current=${PLAN[LLAMA_IMAGE]} tag digest
+  LLAMA_TRY=""
+  case "$current" in
+    *@sha256:*) tag=$LLAMA_UPDATE_TAG ;;
+    *) tag=$current ;;
   esac
+  [ -n "$tag" ] || return 0
   if [ "$DRY_RUN" = 1 ]; then
-    note "would write the exact build of $image into LLAMA_IMAGE in $ENV_FILE"
+    if [ "$tag" != "$current" ]; then note "would download $tag, to try its newest build"; fi
+    note "would write the exact build of $tag into LLAMA_IMAGE in $ENV_FILE once the model has loaded with it"
     return 0
   fi
-  if pinned=$(image_digest_ref "$image"); then
-    env_set LLAMA_IMAGE "$pinned"
-    PLAN[LLAMA_IMAGE]=$pinned
-    note "Model server build recorded: ${pinned##*@}"
+  if [ "$tag" != "$current" ]; then
+    note "Downloading the newest build of the model server, to try it."
+    if ! run_logged docker pull "$tag"; then
+      warn "The newest build of the model server could not be downloaded. The current one stays."
+      return 0
+    fi
+  fi
+  if digest=$(image_digest_ref "$tag"); then
+    if [ "$digest" != "$current" ]; then LLAMA_TRY=$digest; fi
+  elif [ "$tag" = "$current" ]; then
+    warn "Could not read the exact build of $tag; LLAMA_IMAGE keeps the moving tag."
   else
-    warn "Could not read the exact build of $image; LLAMA_IMAGE keeps the moving tag."
+    warn "Could not read the exact build of $tag. The model server stays on the current one."
   fi
 }
 
@@ -1362,6 +1495,56 @@ llm_failure_help() { # RC
   else
     printf 'The model server stopped or keeps restarting.\n'
   fi
+}
+
+# Start the model server and wait until the model is loaded. A build in
+# LLAMA_TRY is given to compose for this one start; the settings record it
+# only once the model has loaded with it. Until then they keep the build that
+# worked: if this run is stopped, the 5-minute repair goes back to that one,
+# and the next run can still go back to it.
+start_llm() {
+  local data=${PLAN[DATA_DIR]} file=${PLAN[MODEL_FILE]} current=${PLAN[LLAMA_IMAGE]} rc=0
+  note "Starting the model server. Loading the model into memory takes a few minutes."
+  # rc: 0 loaded, 1 not ready in time, 2 stopped or crashing, 3 not started.
+  if [ -n "$LLAMA_TRY" ]; then
+    LLAMA_IMAGE=$LLAMA_TRY run_dc up -d llm || rc=3
+  else
+    run_dc up -d llm || rc=3
+  fi
+  if [ "$rc" -eq 0 ]; then wait_healthy llm 1800 "the model to load" || rc=$?; fi
+  if [ "$rc" -eq 0 ]; then
+    if [ -n "$LLAMA_TRY" ]; then
+      env_set LLAMA_IMAGE "$LLAMA_TRY"
+      PLAN[LLAMA_IMAGE]=$LLAMA_TRY
+      note "Model server build recorded: ${LLAMA_TRY##*@}"
+      if [[ $current == *@sha256:* ]]; then REPLACED_LLAMA=$current; fi
+    fi
+    note "The model is loaded."
+    return 0
+  fi
+
+  # A newer build that fails: back to the build that worked, if there is one.
+  if [ -n "$LLAMA_TRY" ] && [[ $current == *@sha256:* ]]; then
+    dc logs --tail 20 llm 2>&1 | sed 's/^/      | /' >&2 || true
+    warn "The newer model server build did not load the model (its messages are above). Going back to the build that worked."
+    rc=0
+    run_dc up -d llm || rc=3
+    if [ "$rc" -eq 0 ]; then wait_healthy llm 1800 "the model to load" || rc=$?; fi
+    if [ "$rc" -eq 0 ]; then
+      note "The model is loaded, with the model server build from before."
+      return 0
+    fi
+    warn "The build from before does not load the model now either, so the newer build is not the cause."
+  fi
+  if [ "$rc" -eq 3 ]; then
+    die "The model server could not be started." "The message above says why; more with: myai logs llm"
+  fi
+  dc logs --tail 20 llm 2>&1 | sed 's/^/      | /' >&2 || true
+  die "$(llm_failure_help "$rc")" \
+    "Its last messages are above; more with: myai logs llm" \
+    "Usual cause: too little free memory. A smaller model: run the install command again with --model fast at the end." \
+    "If the messages say that the model file cannot be read, delete it and run the installer again to download it afresh:" \
+    "  rm $data/models/$file"
 }
 
 start_stack() {
@@ -1377,31 +1560,12 @@ start_stack() {
   note "Downloading the container images (a few GB the first time)."
   run_dc pull --ignore-buildable || die "The container images could not be downloaded." \
     "This is usually a short network problem. Run the same command again."
-  pin_llama_image
+  pick_llama_build
   note "Building the agent and the sandbox."
   run_dc build agent sandbox || die "Building the agent or the sandbox failed." \
     "The messages above show where. Run the same command again; if it fails the same way, report those messages."
 
-  note "Starting the model server. Loading the model into memory takes a few minutes."
-  run_dc up -d llm || die "The model server could not be started." "See: myai logs llm"
-  wait_healthy llm 1800 "the model to load" || rc=$?
-
-  if [ "$rc" -ne 0 ] && [ -n "$OLD_LLAMA_IMAGE" ] && [ "$OLD_LLAMA_IMAGE" != "${PLAN[LLAMA_IMAGE]}" ]; then
-    warn "The newer model server build did not start. Going back to the build that worked."
-    env_set LLAMA_IMAGE "$OLD_LLAMA_IMAGE"
-    PLAN[LLAMA_IMAGE]=$OLD_LLAMA_IMAGE
-    rc=0
-    run_dc up -d llm || rc=2
-    if [ "$rc" -eq 0 ]; then wait_healthy llm 1800 "the model to load" || rc=$?; fi
-  fi
-  if [ "$rc" -ne 0 ]; then
-    dc logs --tail 20 llm 2>&1 | sed 's/^/      | /' >&2 || true
-    die "$(llm_failure_help "$rc")" \
-      "Its last messages are above; more with: myai logs llm" \
-      "Usual causes: too little free memory (try: --model fast) or a damaged model file" \
-      "(delete $data/models/$file and run the installer again to download it afresh)."
-  fi
-  note "The model is loaded."
+  start_llm
 
   note "Starting the other services."
   run_dc up -d --remove-orphans || die "The services could not be started." "See: myai status   and: myai logs"
@@ -1454,13 +1618,19 @@ self_test() {
   rm -f "$proof"
   out=$(agent_task "Use the write_file tool to create the file myai-selftest.txt with the content OK. Then answer with the single word: done" 900) || true
   out=${out##*$'\n'}
+  # The file in the shared workspace proves that the tool really ran.
   if [ -f "$proof" ]; then
-    note "Passed: the agent used a tool and wrote a file."
+    secs=""
+    case "$out" in
+      "ok "*) read -r _ _ secs _ <<<"$out" || true ;;
+    esac
+    note "Passed: the agent used a tool and wrote a file${secs:+ in $secs seconds}."
     rm -f "$proof"
   else
     SELFTEST_FAILED=1
     case "$out" in
-      "ok "*) warn "The agent answered, but did not use the tool it was asked to use." ;;
+      "ok 0 "*) warn "The agent answered, but without using the tool it was asked to use." ;;
+      "ok "*) warn "The agent used a tool (${out##* }), but the test file did not appear in ${workspace}." ;;
       *) warn "The agent test failed: ${out#error }" ;;
     esac
   fi
@@ -1471,11 +1641,65 @@ self_test() {
   fi
 }
 
+# Free KB on the disk that holds DIR; empty when unknown.
+free_kb() {
+  df -Pk "${1:-/}" 2>/dev/null | awk 'NR == 2 && $4 ~ /^[0-9]+$/ { print $4 }'
+}
+
+# Once the services run, remove the image versions that this update
+# replaced (Open WebUI alone is about 6 GB per version, and an update every
+# few weeks would fill the disk over a year), and old builds of the agent
+# and the sandbox. Only those: never other images on this server. The model
+# server build from before stays when the test failed with the new one.
+remove_replaced_images() {
+  local img key in_use list="$APP_DIR/.replaced-images" removed=0 root before after
+  [ "$STACK_STARTED" = 1 ] || return 0
+  if [ -n "$REPLACED_LLAMA" ] && [ "$SELFTEST_FAILED" != 1 ]; then REPLACED_IMAGES+=("$REPLACED_LLAMA"); fi
+  if [ "$DRY_RUN" = 1 ]; then
+    for img in ${REPLACED_IMAGES[@]+"${REPLACED_IMAGES[@]}"}; do note "would remove the replaced image $img"; done
+    if [ "$OPT_UPDATE" = 1 ]; then
+      note "would remove old builds of the agent and the sandbox (images of this project only)"
+    fi
+    return 0
+  fi
+  # Versions an earlier update replaced but could not remove any more.
+  if [ -f "$list" ]; then
+    while IFS= read -r img; do
+      if [ -n "$img" ]; then REPLACED_IMAGES+=("$img"); fi
+    done <"$list"
+  fi
+  root=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null) || root=""
+  before=$(free_kb "${root:-/}")
+  for img in ${REPLACED_IMAGES[@]+"${REPLACED_IMAGES[@]}"}; do
+    # Never one that the settings use now.
+    in_use=0
+    for key in LLAMA_IMAGE WEBUI_IMAGE SEARXNG_IMAGE CADDY_IMAGE; do
+      if [ "${PLAN[$key]:-}" = "$img" ]; then in_use=1; fi
+    done
+    [ "$in_use" = 0 ] || continue
+    # Fails when a container still uses it: then it stays.
+    if docker image rm "$img" >/dev/null 2>&1; then removed=$((removed + 1)); fi
+  done
+  rm -f -- "$list"
+  # Dangling builds of this compose project, nothing else.
+  docker image prune -f --filter "label=com.docker.compose.project=myai" >/dev/null 2>&1 || true
+  after=$(free_kb "${root:-/}")
+  if [[ $before =~ ^[0-9]+$ ]] && [[ $after =~ ^[0-9]+$ ]] && [ $((after - before)) -gt 100000 ]; then
+    note "Removed container images that are no longer used: $(fmt_gb $(((after - before) * 1024))) of disk space freed."
+  elif [ "$removed" -gt 0 ]; then
+    note "Removed container images that are no longer used."
+  fi
+}
+
 # ------------------------------------------- step 10: command and timers ---
 
 install_timers() {
+  # Called inside "if", where set -e does not apply: every step is checked.
+  # A oneshot service has no time limit of its own. Both get one, so that a
+  # command that hangs cannot hold the myai lock until the next reboot; the
+  # repair's limit is shorter than the 15 minutes other commands wait for it.
   local dir="$MYAI_SYSROOT/etc/systemd/system" changed=0
-  write_file_if_changed "$dir/myai-backup.service" 644 <<'EOF'
+  write_file_if_changed "$dir/myai-backup.service" 644 <<'EOF' || return 1
 [Unit]
 Description=myai: daily backup of settings and data
 After=docker.service
@@ -1484,9 +1708,10 @@ After=docker.service
 Type=oneshot
 Environment=HOME=/root
 ExecStart=/usr/local/bin/myai backup
+TimeoutStartSec=2h
 EOF
   changed=$((changed + FILE_CHANGED))
-  write_file_if_changed "$dir/myai-backup.timer" 644 <<'EOF'
+  write_file_if_changed "$dir/myai-backup.timer" 644 <<'EOF' || return 1
 [Unit]
 Description=myai: daily backup at 03:15
 
@@ -1498,7 +1723,7 @@ Persistent=true
 WantedBy=timers.target
 EOF
   changed=$((changed + FILE_CHANGED))
-  write_file_if_changed "$dir/myai-heal.service" 644 <<'EOF'
+  write_file_if_changed "$dir/myai-heal.service" 644 <<'EOF' || return 1
 [Unit]
 Description=myai: keep the services running
 After=docker.service
@@ -1507,9 +1732,10 @@ After=docker.service
 Type=oneshot
 Environment=HOME=/root
 ExecStart=/usr/local/bin/myai heal
+TimeoutStartSec=10min
 EOF
   changed=$((changed + FILE_CHANGED))
-  write_file_if_changed "$dir/myai-heal.timer" 644 <<'EOF'
+  write_file_if_changed "$dir/myai-heal.timer" 644 <<'EOF' || return 1
 [Unit]
 Description=myai: check the services every 5 minutes
 
@@ -1570,7 +1796,7 @@ final_summary() {
   printf '%s\n' "$text"
   printf '\nThe link from point 1 as a QR code (point your phone camera at it):\n'
   print_qr "$link"
-  if [ -z "${PLAN[CADDY_TLS_LINE]}" ]; then
+  if ! tls_is_self_signed "${PLAN[CADDY_TLS_LINE]:-}"; then
     printf '\nThe certificate is fetched in the first minute. If the browser warns, wait and reload.\n'
   fi
   if [ -n "$SPEED_TEXT" ]; then
@@ -1587,7 +1813,7 @@ final_summary() {
 Three commands to know:
   myai status    is everything running?
   myai doctor    checks the address, certificate, memory and disk, with advice
-  myai bench     finds the best number of threads for this server (about 10 minutes)
+  myai bench     finds the best number of threads (the chat pauses for 10 to 15 minutes)
 
 All of the above is saved in /root/myai-credentials.txt (only root can read it).
 Show it again any time with: myai creds
@@ -1605,15 +1831,22 @@ main() {
   PATH="$PATH:/usr/local/sbin:/usr/sbin:/sbin"
   trap on_exit EXIT
   trap 'FAILED_AT="$BASH_COMMAND"' ERR
+  # Without these, on_exit sees the status 0 after Ctrl+C or a closed
+  # terminal and says nothing.
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  trap 'exit 129' HUP
   set -E
 
   if [ "$DRY_RUN" = 1 ]; then
-    say "myai installer: DRY RUN. Nothing is changed. Lines with \"would\" show what a real run does."
+    say "myai installer: DRY RUN, nothing is changed. Lines with \"would\" are what a real run does;"
+    say "the other lines are what it reports."
   elif [ "$OPT_UPDATE" = 1 ]; then
     say "myai: updating the app in $APP_DIR. Settings and data are kept."
   else
     say "myai installer. This sets up a private AI chat and agent on this server."
-    say "It takes 15 to 60 minutes; most of that is downloading the model. You can leave it running."
+    say "It takes 15 to 60 minutes; most of that is downloading the model. Keep this window open."
+    say "If it closes or the connection drops, run the same command again: it continues where it stopped."
   fi
 
   step "Checking this server"
@@ -1643,6 +1876,7 @@ main() {
 
   step "Testing"
   self_test
+  remove_replaced_images
 
   step "The myai command, nightly backups, automatic repair"
   install_command_and_timers

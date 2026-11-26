@@ -9,18 +9,21 @@ from __future__ import annotations
 
 import secrets
 from pathlib import Path
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Request
+from fastapi import Path as PathParam
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
-from .api_common import ApiError, client_id, is_json, read_json
+from .api_common import ApiError, is_json, read_json
 from .auth import SESSION_COOKIE, SESSION_SECONDS
 from .runner import QueueFull
 from .schedules import ScheduleError
 from .services import Services
 
 SMALL_BODY = 64 * 1024
+# Row ids as SQLite can hold them; anything larger is a 400, not an OverflowError deep down.
+RowId = Annotated[int, PathParam(ge=1, le=2**63 - 1)]
 _PAGE = (Path(__file__).parent / "dashboard.html").read_text(encoding="utf-8")
 
 
@@ -52,7 +55,7 @@ def build_router(sv: Services) -> APIRouter:
         raise ApiError(401, "not signed in")
 
     def schedule_view(sched: dict[str, Any]) -> dict[str, Any]:
-        return {**sched, "next_run_text": sv.schedules.fmt(sched["next_run"]) if sched["enabled"] else "-"}
+        return {**sched, "next_run_text": sv.schedules.next_text(sched)}
 
     # ---- public ----
     @router.get("/healthz")
@@ -74,14 +77,14 @@ def build_router(sv: Services) -> APIRouter:
             raise ApiError(403, "password login is disabled on this server")
         if not is_json(request):
             raise ApiError(415, "Content-Type must be application/json")
-        who = client_id(request)
-        wait = auth.retry_after(who)
+        who = await auth.client_key(request)
+        body = await read_json(request, 4096)
+        # Nothing is awaited between reading the body and answering: see Auth.check_login.
+        ok, wait = auth.check_login(who, body.get("password"))
         if wait:
             raise ApiError(429, f"too many failed attempts; try again in {wait} seconds",
                            headers={"Retry-After": str(wait)})
-        body = await read_json(request, 4096)
-        if not auth.password_ok(body.get("password")):
-            auth.record_failure(who)
+        if not ok:
             raise ApiError(401, "wrong password")
         resp = JSONResponse({"ok": True})
         resp.set_cookie(SESSION_COOKIE, auth.new_session(), max_age=SESSION_SECONDS, path="/agent",
@@ -127,7 +130,7 @@ def build_router(sv: Services) -> APIRouter:
         return {"id": task_id}
 
     @router.get("/api/tasks/{task_id}")
-    async def get_task(request: Request, task_id: int) -> dict[str, Any]:
+    async def get_task(request: Request, task_id: RowId) -> dict[str, Any]:
         authorize(request)
         task = sv.db.get_task(task_id)
         if task is None:
@@ -135,7 +138,7 @@ def build_router(sv: Services) -> APIRouter:
         return task
 
     @router.post("/api/tasks/{task_id}/cancel")
-    async def cancel_task(request: Request, task_id: int) -> dict[str, Any]:
+    async def cancel_task(request: Request, task_id: RowId) -> dict[str, Any]:
         authorize(request, write=True)
         outcome = sv.runner.cancel(task_id)
         if outcome == "not_found":
@@ -163,7 +166,7 @@ def build_router(sv: Services) -> APIRouter:
             raise ApiError(400, str(exc)) from None
 
     @router.patch("/api/schedules/{schedule_id}")
-    async def patch_schedule(request: Request, schedule_id: int) -> dict[str, Any]:
+    async def patch_schedule(request: Request, schedule_id: RowId) -> dict[str, Any]:
         authorize(request, write=True)
         body = await read_json(request, 4096)
         if not isinstance(body.get("enabled"), bool):
@@ -174,7 +177,7 @@ def build_router(sv: Services) -> APIRouter:
         return schedule_view(sched)
 
     @router.delete("/api/schedules/{schedule_id}")
-    async def delete_schedule(request: Request, schedule_id: int) -> dict[str, bool]:
+    async def delete_schedule(request: Request, schedule_id: RowId) -> dict[str, bool]:
         authorize(request, write=True)
         if not sv.schedules.delete(schedule_id):
             raise ApiError(404, "no such schedule")
@@ -187,7 +190,7 @@ def build_router(sv: Services) -> APIRouter:
         return {"notes": sv.db.list_notes(limit)}
 
     @router.delete("/api/notes/{note_id}")
-    async def delete_note(request: Request, note_id: int) -> dict[str, bool]:
+    async def delete_note(request: Request, note_id: RowId) -> dict[str, bool]:
         authorize(request, write=True)
         if not sv.db.delete_note(note_id):
             raise ApiError(404, "no such note")

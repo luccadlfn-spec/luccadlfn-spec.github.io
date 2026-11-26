@@ -26,6 +26,9 @@ MAX_INLINE_TURNS = 4
 KEEPALIVE_SECONDS = 20.0
 SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
 
+NO_TEXT_REPLY = ("I can only read text, and your last message has none (an image or a file on its own). "
+                 "Please describe what you need in words.")
+
 MODELS = (("assistant", "Assistant (fast chat)"),
           ("assistant-deep", "Assistant (thinks before answering)"),
           ("agent", "Agent (can search, run code, remember, schedule)"))
@@ -54,25 +57,26 @@ def split_messages(messages: Any) -> tuple[list[dict[str, str]], str, str]:
     """Client messages -> (earlier user/assistant turns, newest user text, client system text).
 
     Only text is kept. Tool messages and anything after the newest user message are dropped.
+    The newest user text is "" when that message has none (an image only); it is never
+    replaced by an older question.
     """
     if not isinstance(messages, list) or not messages:
         raise ApiError(400, "'messages' must be a non-empty list")
+    recent = [m for m in messages[-MAX_CLIENT_MESSAGES:] if isinstance(m, dict)]
+    last_user = max((i for i, m in enumerate(recent) if m.get("role") == "user"), default=-1)
+    if last_user < 0:
+        raise ApiError(400, "there is no user message")
     system: list[str] = []
     turns: list[dict[str, str]] = []
-    for msg in messages[-MAX_CLIENT_MESSAGES:]:
-        if not isinstance(msg, dict):
-            continue
+    for i, msg in enumerate(recent):
         role, text = msg.get("role"), _text_of(msg.get("content")).strip()
         if not text:
             continue
         if role in ("system", "developer"):
             system.append(text)
-        elif role in ("user", "assistant"):
+        elif role in ("user", "assistant") and i < last_user:
             turns.append({"role": role, "content": text})
-    last_user = max((i for i, t in enumerate(turns) if t["role"] == "user"), default=-1)
-    if last_user < 0:
-        raise ApiError(400, "there is no user message with text")
-    return turns[:last_user], turns[last_user]["content"], "\n\n".join(system)
+    return turns, _text_of(recent[last_user].get("content")).strip(), "\n\n".join(system)
 
 
 class _QueueListener(TurnListener):
@@ -160,13 +164,26 @@ def build_router(sv: Services) -> APIRouter:
         return Response(content=data, status_code=upstream.status_code, media_type=ctype)
 
     async def relay(request: Request, upstream: httpx.Response) -> AsyncIterator[bytes]:
-        """Copy upstream SSE bytes to the client; close upstream as soon as the client is gone."""
+        """Copy upstream SSE bytes to the client; close upstream as soon as the client is gone.
+
+        If the model server fails once the answer has started (crash, restart, read
+        timeout), the client gets an error event and [DONE], the way Open WebUI reports a
+        broken stream itself, instead of a quiet end that makes half an answer look whole.
+        """
         chunks = upstream.aiter_raw().__aiter__()
         try:
             while True:
                 try:
                     chunk = await until_disconnect(request, chunks.__anext__())
-                except (StopAsyncIteration, ClientGone, httpx.HTTPError):
+                except (StopAsyncIteration, ClientGone):
+                    break
+                except httpx.HTTPError as exc:
+                    message = ("The model server sent nothing for too long and the answer was cut off."
+                               if isinstance(exc, httpx.TimeoutException)
+                               else "The model server stopped in the middle of the answer.")
+                    frame = json.dumps({"error": {"message": message, "type": "upstream_error"}})
+                    # The blank lines first end any event the model server left half-written.
+                    yield f"\n\ndata: {frame}\n\ndata: [DONE]\n\n".encode()
                     break
                 yield chunk
         finally:
@@ -183,15 +200,41 @@ def build_router(sv: Services) -> APIRouter:
         return {"prompt_tokens": result.prompt_tokens, "completion_tokens": result.completion_tokens,
                 "total_tokens": result.prompt_tokens + result.completion_tokens}
 
+    def chunk(cid: str, created: int, delta: dict[str, Any], finish: str | None = None) -> bytes:
+        data = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "agent",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+        return f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
+
+    def ending(result: TurnResult, cid: str, created: int, want_usage: bool) -> bytes:
+        out = chunk(cid, created, {}, "stop")
+        if want_usage:
+            data = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "agent",
+                    "choices": [], "usage": usage(result)}
+            out += f"data: {json.dumps(data)}\n\n".encode("utf-8")
+        return out + b"data: [DONE]\n\n"
+
+    async def replay(result: TurnResult, cid: str, created: int, want_usage: bool) -> AsyncIterator[bytes]:
+        """A fixed answer, streamed in the same form as a real turn."""
+        yield chunk(cid, created, {"role": "assistant", "content": ""})
+        yield chunk(cid, created, {"content": result.text})
+        yield ending(result, cid, created, want_usage)
+
     async def agent_chat(request: Request, body: dict[str, Any]) -> Response:
         history, user_text, system_extra = split_messages(body.get("messages"))
+        cid, created = "chatcmpl-" + secrets.token_hex(12), int(time.time())
+        opts = body.get("stream_options")
+        want_usage = isinstance(opts, dict) and bool(opts.get("include_usage"))
+        if not user_text:
+            # An image or a file alone: say so, rather than answer something else.
+            reply = TurnResult(text=NO_TEXT_REPLY)
+            if body.get("stream"):
+                return StreamingResponse(replay(reply, cid, created, want_usage),
+                                         media_type="text/event-stream", headers=SSE_HEADERS)
+            return JSONResponse(completion(reply, cid, created))
         if sv.runner.inline >= MAX_INLINE_TURNS:
             return openai_error(429, "Too many agent chats are running. Try again in a moment.",
                                 "rate_limit_error")
-        cid, created = "chatcmpl-" + secrets.token_hex(12), int(time.time())
         if body.get("stream"):
-            opts = body.get("stream_options")
-            want_usage = isinstance(opts, dict) and bool(opts.get("include_usage"))
             return StreamingResponse(
                 agent_stream(request, history, user_text, system_extra, cid, created, want_usage),
                 media_type="text/event-stream", headers=SSE_HEADERS)
@@ -207,11 +250,6 @@ def build_router(sv: Services) -> APIRouter:
 
     async def agent_stream(request: Request, history: list[dict], user_text: str, system_extra: str,
                            cid: str, created: int, want_usage: bool) -> AsyncIterator[bytes]:
-        def chunk(delta: dict[str, Any], finish: str | None = None) -> bytes:
-            data = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "agent",
-                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-            return f"data: {json.dumps(data, ensure_ascii=False, separators=(',', ':'))}\n\n".encode("utf-8")
-
         queue: asyncio.Queue = asyncio.Queue()
         cancel = asyncio.Event()
         run = sv.runner.detach(sv.runner.run_inline(
@@ -219,7 +257,7 @@ def build_router(sv: Services) -> APIRouter:
             listener=_QueueListener(queue), cancel=cancel))
         run.add_done_callback(lambda _t: queue.put_nowait(None))
         try:
-            yield chunk({"role": "assistant", "content": ""})
+            yield chunk(cid, created, {"role": "assistant", "content": ""})
             quiet_since = time.monotonic()
             while True:
                 try:
@@ -236,7 +274,7 @@ def build_router(sv: Services) -> APIRouter:
                 if item is None:
                     break
                 kind, text = item
-                yield chunk({"content": text} if kind == "content" else {"reasoning_content": text})
+                yield chunk(cid, created, {"content": text} if kind == "content" else {"reasoning_content": text})
                 quiet_since = time.monotonic()
             try:
                 _task_id, result = run.result()
@@ -244,13 +282,8 @@ def build_router(sv: Services) -> APIRouter:
                 result = TurnResult(status="error", text="Sorry, that did not work: the run was interrupted.")
             if result.status != "done":
                 # The answer itself was already streamed; these outcomes add a closing message.
-                yield chunk({"content": result.text})
-            yield chunk({}, "stop")
-            if want_usage:
-                data = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": "agent",
-                        "choices": [], "usage": usage(result)}
-                yield f"data: {json.dumps(data)}\n\n".encode("utf-8")
-            yield b"data: [DONE]\n\n"
+                yield chunk(cid, created, {"content": result.text})
+            yield ending(result, cid, created, want_usage)
         finally:
             # Reached on normal completion and when the client disconnects mid-stream.
             cancel.set()

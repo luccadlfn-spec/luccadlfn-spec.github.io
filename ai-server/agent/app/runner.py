@@ -3,7 +3,8 @@
 One task runs at a time. Interactive tasks always go first; a background task
 that is already running hands the worker over to waiting interactive tasks
 between its model calls (see `_pause`), so nothing interactive ever waits for
-more than one background model call.
+more than one background model call. Between those calls a background task
+also rests, and waits for as long as the CPU governor holds background work back.
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ log = logging.getLogger(__name__)
 
 MAX_QUEUED = 100
 MAX_PROMPT_CHARS = 16_000
+FINISHED = ("done", "max_steps", "context_full")     # turn outcomes that count as a finished task
 IDLE_POLL = 5.0                # how often the worker rechecks the governor while idle
 STEP_FLUSH_SECONDS = 1.0
 
@@ -62,6 +64,7 @@ class TaskRunner:
         self._cancels: dict[int, asyncio.Event] = {}
         self._hooks: list[FinishHook] = []
         self.current: int | None = None       # id of the queue task being worked on
+        self.held: int | None = None          # background task waiting for the CPU governor
         self.inline = 0                       # turns running inside API requests
         self.detached: set[asyncio.Task] = set()   # streamed turns that outlive their request handler
 
@@ -108,6 +111,7 @@ class TaskRunner:
         event = self._cancels.get(task_id)
         if event is not None:
             event.set()
+            self._wake.set()                  # a task resting in `_pause` stops waiting at once
             return "cancelling"
         return "finished"
 
@@ -119,7 +123,8 @@ class TaskRunner:
         current = self.db.get_task(self.current) if self.current else None
         return {"queued": self.db.count_tasks("queued"), "running": self.db.count_tasks("running"),
                 "current": ({"id": current["id"], "kind": current["kind"], "prompt": current["prompt"][:120]}
-                            if current else None)}
+                            if current else None),
+                "held": self.held}
 
     # ---- worker ----
     async def run_forever(self) -> None:
@@ -140,22 +145,57 @@ class TaskRunner:
                 log.exception("worker error")
                 await asyncio.sleep(2.0)      # never spin on a persistent failure
 
-    async def _pause(self, call_seconds: float) -> None:
-        """Between two model calls of a background task: rest, and serve interactive work."""
-        deadline = time.monotonic() + self.governor.rest_seconds(call_seconds)
-        while True:
-            task = self.db.claim_next_task(include_background=False)
-            if task is not None:
-                await self._execute(task)
-                continue
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(self._wake.wait(), min(remaining, IDLE_POLL))
-            except asyncio.TimeoutError:
-                pass
+    async def _pause(self, call_seconds: float, *, hold: bool = False, task_id: int | None = None,
+                     cancel: asyncio.Event | None = None, timer: asyncio.Timeout | None = None) -> str | None:
+        """After a model call of a background task: rest, and serve interactive work meanwhile.
+
+        With `hold` (between two calls of the same task) it then also waits for as long as
+        the CPU governor holds background work back. Returns a note for the step log when
+        it had to wait for that.
+        """
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        # The task's own time limit is for its work, not for this pause, which may run
+        # interactive tasks and wait out CPU throttling for a long time. It is switched off
+        # meanwhile, so it can never cancel an interactive task that runs in here.
+        deadline = timer.when() if timer is not None else None
+        if deadline is not None:
+            timer.reschedule(None)
+        rest_until = time.monotonic() + self.governor.rest_seconds(call_seconds)
+        held_since: float | None = None
+        try:
+            while True:
+                task = self.db.claim_next_task(include_background=False)
+                if task is not None:
+                    await self._execute(task)
+                    continue
+                if cancel is not None and cancel.is_set():
+                    break
+                now = time.monotonic()
+                if now < rest_until:
+                    wait = min(rest_until - now, IDLE_POLL)
+                elif hold and not self.governor.may_run_background():
+                    if held_since is None:
+                        held_since, self.held = now, task_id
+                        log.info("task %s waits for the CPU governor: %s", task_id, self.governor.reason())
+                    wait = IDLE_POLL
+                else:
+                    break
+                self._wake.clear()
+                try:
+                    await asyncio.wait_for(self._wake.wait(), wait)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            if held_since is not None and self.held == task_id:
+                self.held = None
+            if deadline is not None:
+                timer.reschedule(deadline + (loop.time() - began))
+        if held_since is None:
+            return None
+        waited = time.monotonic() - held_since
+        took = f"{waited:.0f} s" if waited < 90 else f"{waited / 60:.0f} min"
+        return f"waited {took} for the CPU governor to allow background work again"
 
     async def _execute(self, task: dict[str, Any]) -> None:
         task_id = task["id"]
@@ -166,9 +206,8 @@ class TaskRunner:
             history = self.db.get_messages(task["conversation_id"])
         try:
             result = await self._run(task_id, history, task["prompt"], background=background,
-                                     scheduled=task["kind"] == "scheduled",
-                                     pause=self._pause if background else None)
-            if result.status in ("done", "max_steps") and task["conversation_id"] \
+                                     scheduled=task["kind"] == "scheduled", schedule_id=task["schedule_id"])
+            if result.status in FINISHED and task["conversation_id"] \
                     and self.db.conversation_exists(task["conversation_id"]):
                 # Stored exactly as sent, so the next turn's prompt prefix matches the cache.
                 self.db.add_message(task["conversation_id"], "user", result.user_content)
@@ -195,9 +234,8 @@ class TaskRunner:
         return task_id, result
 
     async def _run(self, task_id: int, history: list[dict], user_text: str, *, background: bool,
-                   scheduled: bool, system_extra: str = "", listener: TurnListener | None = None,
-                   cancel: asyncio.Event | None = None,
-                   pause: Callable[[float], Awaitable[None]] | None = None,
+                   scheduled: bool, schedule_id: int | None = None, system_extra: str = "",
+                   listener: TurnListener | None = None, cancel: asyncio.Event | None = None,
                    inline: bool = False) -> TurnResult:
         cancel = cancel or asyncio.Event()
         self._cancels[task_id] = cancel
@@ -205,19 +243,23 @@ class TaskRunner:
         limit = self.s.turn_timeout * (3 if background else 1)
         result = TurnResult(status="error", error="internal error")
         try:
-            async with asyncio.timeout(limit):
+            async with asyncio.timeout(limit) as timer:
+                async def pause(seconds: float) -> str | None:
+                    return await self._pause(seconds, hold=True, task_id=task_id, cancel=cancel, timer=timer)
+
                 result = await self.agent.run_turn(
-                    history, user_text, background=background, scheduled=scheduled,
-                    system_extra=system_extra, listener=recorder, cancel=cancel, pause=pause)
+                    history, user_text, background=background, scheduled=scheduled, schedule_id=schedule_id,
+                    system_extra=system_extra, listener=recorder, cancel=cancel,
+                    pause=pause if background else None)
         except TimeoutError:
             result = TurnResult(status="error", error=f"timed out after {limit / 60:.0f} minutes")
             result.text = f"Sorry, that did not work: the task {result.error}."
         except asyncio.CancelledError:
-            # The caller went away (inline) or the service is stopping (queue task).
-            # Leave an honest record, then let the cancellation continue.
-            gone = (TurnResult(status="cancelled", text="Cancelled.") if inline
-                    else TurnResult(status="error", error="interrupted by restart"))
-            self._finish(task_id, gone)
+            # The caller went away (inline): record that. Otherwise the service is stopping;
+            # the task stays "running" so that the next start marks it like a task cut off
+            # by a crash, and tells its owner (Services.start). Then let the cancellation go on.
+            if inline:
+                self._finish(task_id, TurnResult(status="cancelled", text="Cancelled."))
             raise
         except Exception as exc:
             log.exception("task %s failed", task_id)
@@ -230,7 +272,7 @@ class TaskRunner:
         return result
 
     def _finish(self, task_id: int, result: TurnResult) -> None:
-        status = {"done": "done", "max_steps": "done", "cancelled": "cancelled"}.get(result.status, "error")
+        status = "done" if result.status in FINISHED else "cancelled" if result.status == "cancelled" else "error"
         try:
             self.db.finish_task(task_id, status, result=result.text, error=result.error, steps=result.steps)
         except Exception:

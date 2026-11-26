@@ -252,9 +252,10 @@ class TelegramBot:
             await self._sleep(TYPING_EVERY)
 
     def _cancel(self, arg: str) -> str:
-        if not arg.lstrip("#").isdigit():
+        digits = arg.lstrip("#")
+        if not (digits.isascii() and digits.isdigit() and len(digits) <= 12):
             return "Usage: /cancel <task id>   (see /tasks)"
-        task_id = int(arg.lstrip("#"))
+        task_id = int(digits)
         outcome = self.runner.cancel(task_id)
         return {"cancelled": f"Task #{task_id} cancelled.",
                 "cancelling": f"Stopping task #{task_id}.",
@@ -272,7 +273,8 @@ class TelegramBot:
     def _format_status(st: dict[str, Any]) -> str:
         model, queue, gov = st.get("model", {}), st.get("queue", {}), st.get("governor", {})
         lines = [f"Model: {model.get('state', 'unknown')}",
-                 f"Queue: {queue.get('queued', 0)} waiting, {queue.get('running', 0)} running"]
+                 f"Queue: {queue.get('queued', 0)} waiting, {queue.get('running', 0)} running"
+                 + (f"; task #{queue['held']} is paused by the CPU governor" if queue.get("held") else "")]
         if gov.get("enabled"):
             lines.append(f"CPU: {gov.get('busy_pct')}% busy, {gov.get('steal_pct')}% steal, "
                          f"credits about {gov.get('credits_pct')}% ({gov.get('reason')})")
@@ -301,6 +303,25 @@ class TelegramBot:
         except TelegramError as exc:
             self.last_error = str(exc)
             log.warning("telegram: could not deliver a result: %s", exc)
+
+    async def report_interrupted(self, tasks: list[dict[str, Any]]) -> None:
+        """After a restart: tell the owner about work it cut off, instead of dropping it silently."""
+        if not self.enabled:
+            return
+        for task in tasks:
+            preview = " ".join(str(task.get("prompt") or "").split())
+            preview = preview[:80] + ("…" if len(preview) > 80 else "")
+            try:
+                if task["kind"] == "telegram" and task.get("reply_to"):
+                    await self.send(task["reply_to"], "The server restarted while I was working on your "
+                                    f"message, so it was not finished. Please send it again.\n\n({preview})")
+                elif task["kind"] == "scheduled":
+                    note = f'Scheduled task "{task.get("name") or task["id"]}" was interrupted by a server restart.'
+                    for owner in sorted(self.owners()):
+                        await self.send(owner, f"{note} {task.get('next') or ''}".strip())
+            except TelegramError as exc:
+                self.last_error = str(exc)
+                log.warning("telegram: could not report an interrupted task: %s", exc)
 
     # ---- main loop ----
     async def run(self) -> None:

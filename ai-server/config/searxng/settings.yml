@@ -5,6 +5,9 @@
 #
 # The secret key is not in this file: the container gets it from the
 # SEARXNG_SECRET environment variable, which overrides server.secret_key.
+# Likewise general.contact_url comes from SEARXNG_CONTACT_URL (set in
+# docker-compose.yml); without it the Wikipedia, Wikidata and OpenStreetMap
+# engines do not load.
 use_default_settings: true
 
 general:

@@ -1,4 +1,5 @@
-# Only server.py and requirements.txt go into the image.
+# Only server.py, startup/ and requirements.txt go into the image.
 *
 !server.py
+!startup/sitecustomize.py
 !requirements.txt

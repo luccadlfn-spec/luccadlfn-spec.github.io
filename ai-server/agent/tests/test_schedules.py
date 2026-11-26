@@ -147,10 +147,13 @@ async def test_tick_fires_due_schedules_once(make_services):
 
     clock["now"] = NOW + 1800
     assert scheduler.tick() == 1 and scheduler.tick() == 0
-    assert sv.db.get_schedule(once["id"]) is None                    # one-shots are removed after firing
+    fired = sv.db.get_schedule(once["id"])                          # kept while its run is open ...
+    assert fired["next_run"] is None and sv.schedules.next_text(fired) == "running now"
     tasks = sv.db.list_tasks()
     assert [(t["kind"], t["status"], t["background"], t["schedule_id"]) for t in tasks] == \
         [("scheduled", "queued", True, once["id"])]
+    await sv.runner._execute(sv.db.claim_next_task(True))
+    assert scheduler.tick() == 0 and sv.db.get_schedule(once["id"]) is None     # ... and removed after it
 
     clock["now"] = datetime(2026, 11, 27, 8, 0, 5, tzinfo=UTC).timestamp()
     assert scheduler.tick() == 1
@@ -209,3 +212,121 @@ async def test_scheduled_runs_cannot_create_schedules(make_services):
     result = await sv.agent.run_turn([], "unattended job", background=True, scheduled=True)
     assert result.status == "done" and sv.schedules.list() == []
     assert "scheduled tasks cannot create new schedules" in llm.requests[1]["messages"][-1]["content"]
+
+
+async def test_a_one_shot_whose_run_was_cancelled_is_removed(make_services):
+    sv = await make_services(FakeLLM())
+    clock = {"now": NOW}
+    sv.schedules._clock = lambda: clock["now"]
+    scheduler = Scheduler(sv.settings, sv.db, sv.schedules, sv.runner, clock=lambda: clock["now"])
+    once = sv.schedules.add("in 10m", "later")
+    clock["now"] = NOW + 600
+    assert scheduler.tick() == 1
+    assert sv.runner.cancel(sv.db.list_tasks()[0]["id"]) == "cancelled"
+    scheduler.tick()
+    assert sv.db.get_schedule(once["id"]) is None and sv.db.count_tasks("queued") == 0
+
+
+async def test_a_one_shot_cut_off_by_a_restart_runs_once_more_but_not_forever(settings, make_services):
+    from app.services import Services
+    clock = {"now": NOW}
+
+    def restart(running_task: int | None):
+        """The stop of a process whose worker was in the middle of `running_task`."""
+        if running_task is not None:
+            sv.db._x("UPDATE tasks SET status='running' WHERE id=?", (running_task,))
+
+    sv = await make_services(FakeLLM())
+    sv.schedules._clock = lambda: clock["now"]
+    scheduler = Scheduler(sv.settings, sv.db, sv.schedules, sv.runner, clock=lambda: clock["now"])
+    once = sv.schedules.add("in 10m", "check the backup", "Backup")
+    clock["now"] = NOW + 600
+    assert scheduler.tick() == 1
+    first = sv.db.list_tasks()[0]["id"]
+    restart(first)
+
+    again = Services(settings)
+    again.schedules._clock = lambda: clock["now"]
+    await again.start(background=False)
+    try:
+        assert [t["id"] for t in again.interrupted] == [first]
+        assert again.db.get_task(first)["error"] == "interrupted by restart"
+        assert again.interrupted[0]["next"] == "It will be run again now."
+        scheduler = Scheduler(again.settings, again.db, again.schedules, again.runner, clock=lambda: clock["now"])
+        assert scheduler.tick() == 1                                     # the overdue one-shot runs once more
+        second = again.db.list_tasks()[0]["id"]
+        assert second != first and again.db.get_task(second)["schedule_id"] == once["id"]
+        again.db._x("UPDATE tasks SET status='running' WHERE id=?", (second,))
+    finally:
+        await again.stop()
+
+    third = Services(settings)
+    await third.start(background=False)
+    try:
+        assert third.interrupted[0]["next"] == "It was interrupted twice, so it will not be run again."
+        assert third.db.get_schedule(once["id"]) is None
+    finally:
+        await third.stop()
+
+
+async def test_a_scheduled_run_may_cancel_only_its_own_schedule(make_services):
+    """A page read unattended must not be able to remove the owner's other jobs."""
+    news = None
+    llm = FakeLLM(lambda _b: call("cancel_schedule", {"id": news["id"] + 1}, call_id="other"),
+                  lambda _b: call("cancel_schedule", {"id": news["id"]}, call_id="own"),
+                  say("Stopped checking."))
+    sv = await make_services(llm)
+    news = sv.schedules.add("0 7 * * *", "Morning news summary", "news")
+    invoices = sv.schedules.add("0 9 * * 1", "Weekly invoice reminder", "invoices")
+    task_id = sv.runner.submit("scheduled", news["prompt"], background=True, schedule_id=news["id"])
+    await sv.runner._execute(sv.db.claim_next_task(True))
+    outs = [m["content"] for m in llm.requests[-1]["messages"] if m["role"] == "tool"]
+    assert outs == ["Error: a scheduled task can only cancel its own schedule", f"Schedule #{news['id']} cancelled."]
+    assert [s["id"] for s in sv.schedules.list()] == [invoices["id"]]
+    assert sv.db.get_task(task_id)["status"] == "done"
+    out, ok = await sv.toolbox.call("cancel_schedule", {"id": invoices["id"]}, CallContext())
+    assert ok                                               # the owner, interactively, still can
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+
+
+def local(ts: float, tz=NEW_YORK) -> str:
+    return datetime.fromtimestamp(ts, tz).strftime("%Y-%m-%d %H:%M %Z")
+
+
+@pytest.mark.parametrize("expr,runs", [
+    # A fixed hour inside the hour that repeats: once, in the first copy.
+    ("30 1 * * *", ["2026-11-01 01:30 EDT", "2026-11-02 01:30 EST", "2026-11-03 01:30 EST"]),
+    ("45 1 * * 0", ["2026-11-01 01:45 EDT", "2026-11-08 01:45 EST"]),
+    # A wildcard hour keeps its rhythm through both copies, as before.
+    ("30 * * * *", ["2026-11-01 00:30 EDT", "2026-11-01 01:30 EDT", "2026-11-01 01:30 EST", "2026-11-01 02:30 EST"]),
+    ("*/30 * * * *", ["2026-11-01 00:30 EDT", "2026-11-01 01:00 EDT", "2026-11-01 01:30 EDT",
+                      "2026-11-01 01:00 EST", "2026-11-01 01:30 EST"]),
+])
+def test_cron_runs_through_the_night_the_clocks_go_back(expr, runs):
+    from app.schedules import cron_runs
+    start = datetime(2026, 11, 1, 0, 10, tzinfo=NEW_YORK).timestamp()
+    seq = cron_runs(expr, NEW_YORK, start)
+    assert [local(next(seq)) for _ in runs] == runs
+
+
+async def test_the_scheduler_runs_a_daily_job_once_on_the_night_the_clocks_go_back(make_services):
+    sv = await make_services(FakeLLM(), tz_name="America/New_York")
+    clock = {"now": datetime(2026, 10, 31, 12, 0, tzinfo=NEW_YORK).timestamp()}
+    sv.schedules._clock = lambda: clock["now"]
+    scheduler = Scheduler(sv.settings, sv.db, sv.schedules, sv.runner, clock=lambda: clock["now"])
+    sched = sv.schedules.add("30 1 * * *", "nightly summary")
+    fired = []
+    for _ in range(3 * 24 * 60 // 5):                     # three days in five-minute ticks
+        clock["now"] += 300
+        if scheduler.tick():
+            fired.append(local(clock["now"]))
+            await sv.runner._execute(sv.db.claim_next_task(True))
+    assert fired == ["2026-11-01 01:30 EDT", "2026-11-02 01:30 EST", "2026-11-03 01:30 EST"]
+    assert sv.db.get_schedule(sched["id"])["enabled"] is True
+
+
+def test_a_daily_job_is_not_refused_because_of_the_repeated_hour():
+    before = datetime(2026, 10, 31, 12, 0, tzinfo=NEW_YORK).timestamp()
+    assert parse_when("30 1 * * *", NEW_YORK, before, 120).kind == "cron"    # was: "more often than every 120 minutes"

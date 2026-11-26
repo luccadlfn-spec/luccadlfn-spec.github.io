@@ -41,8 +41,8 @@ class Services:
         s = self.settings = settings
         self.db = Database(s.db_path)
         self.llm = LLMClient(s, transport=llm_transport)
-        self.estimator = TokenEstimator(load=lambda: self.db.kv_get("chars_per_token"),
-                                        save=lambda v: self.db.kv_set("chars_per_token", v))
+        self.estimator = TokenEstimator(load=lambda: self.db.kv_get("units_per_token"),
+                                        save=lambda v: self.db.kv_set("units_per_token", v))
         self.schedules = ScheduleService(s, self.db)
         self.workspace = Workspace(s.workspace_dir)
         self.fetcher = Fetcher(resolver=resolver, transport=fetch_transport)
@@ -61,6 +61,7 @@ class Services:
         self.runner.on_finish(self.telegram.on_task_finished)
         self.auth = Auth(s, self.db)
         self._tasks: list[asyncio.Task] = []
+        self.interrupted: list[dict[str, Any]] = []     # tasks the last stop or crash cut off
         self.started = False
 
     async def start(self, background: bool = True) -> None:
@@ -73,9 +74,12 @@ class Services:
             os.makedirs(s.workspace_dir, exist_ok=True)
         except OSError:
             log.warning("workspace directory %s is not available; file tools will fail", s.workspace_dir)
-        interrupted = self.db.mark_interrupted()
-        if interrupted:
-            log.info("%d task(s) were interrupted by the restart", interrupted)
+        self.interrupted = self.db.mark_interrupted()
+        if self.interrupted:
+            log.info("%d task(s) were interrupted by the restart", len(self.interrupted))
+        for task in self.interrupted:
+            if task["kind"] == "scheduled":
+                task["next"] = self.schedules.after_interruption(task)
         self.db.prune_conversations()
         if not s.agent_api_key:
             log.warning("AGENT_API_KEY is empty: the /v1 API and bearer access are disabled")
@@ -84,7 +88,8 @@ class Services:
         if not background:
             return
         loops = {"worker": self.runner.run_forever(), "scheduler": self.scheduler.run(),
-                 "governor": self.governor.run(), "telegram": self.telegram.run()}
+                 "governor": self.governor.run(), "telegram": self.telegram.run(),
+                 "restart notices": self.telegram.report_interrupted(self.interrupted)}
         for name, coro in loops.items():
             self._tasks.append(asyncio.create_task(coro, name=name))
         log.info("agent service %s started (model %s at %s, tools: %s)", __version__, s.llm_model,

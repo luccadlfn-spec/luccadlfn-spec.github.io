@@ -169,7 +169,8 @@ pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--code); b
     const model = $("stModel");
     model.textContent = m.state === "ready" ? "Ready" : (m.state === "loading" ? "Loading the model…" : "Not reachable");
     model.className = m.state === "ready" ? "ok" : (m.state === "loading" ? "warn" : "bad");
-    $("stQueue").textContent = (q.queued || 0) + " waiting, " + ((q.running || 0)) + " running";
+    $("stQueue").textContent = (q.queued || 0) + " waiting, " + ((q.running || 0)) + " running" +
+      (q.held ? " · task #" + q.held + " is paused by the CPU governor" : "");
     const cpu = $("stCpu");
     if (!g.enabled) { cpu.textContent = "Off"; cpu.className = "muted"; }
     else {

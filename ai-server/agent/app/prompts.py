@@ -26,6 +26,7 @@ MAX_SYSTEM_EXTRA_CHARS = 2000
 
 STEP_LIMIT_NOTE = "\n\n[Step limit reached. Give your final answer now without calling a tool.]"
 CONTEXT_FULL_NOTE = "[Result omitted: the context is full. Give your final answer now.]"
+FINAL_ANSWER_NOTE = "\n\n[The context is nearly full. Give your final answer now without calling a tool.]"
 
 
 def system_prompt(extra: str = "") -> str:

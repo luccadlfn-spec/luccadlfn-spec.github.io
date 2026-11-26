@@ -60,6 +60,23 @@ test_preflight_needs_root() {
   assert_contains "$OUT" "sudo -i"
 }
 
+test_preflight_stops_when_the_installer_is_already_running() {
+  load_installer
+  mkdir -p "$APP"
+  expect_ok check_not_installing
+  # The post-install script is still at work when the command is pasted too.
+  hold_lock 2 "the installer"
+  expect_fail check_not_installing
+  assert_contains "$OUT" "The installer is already running (process "
+  assert_contains "$OUT" "there is no need to start it twice"
+  assert_contains "$OUT" "tail -f /root/myai-install.log"
+  wait
+  # A myai command does not stop the checks: step 5 waits for it.
+  hold_lock 2 "myai backup"
+  expect_ok check_not_installing
+  wait
+}
+
 test_preflight_needs_avx2() {
   fake_machine 8 32862000 "fpu sse sse2 avx"
   load_installer
@@ -148,15 +165,19 @@ test_preflight_ports_traefik_is_named_and_explained() {
   assert_contains "$OUT" "That is Traefik"
   assert_contains "$OUT" "Hostinger"
   assert_contains "$OUT" "docker stop traefik-traefik-1 && docker update --restart=no traefik-traefik-1"
+  assert_eq "$(grep -c 'docker stop traefik-traefik-1' <<<"$OUT")" 1 "the advice for both ports is given once"
   assert_contains "$OUT" "Then run the installer again"
 }
 
 test_preflight_ports_other_program_is_named() {
   printf '%s\n' "$SS_NGINX" >"$FAKE_DIR/ss_tcp_80"
+  printf '%s\n' "${SS_NGINX//:80 /:443 }" >"$FAKE_DIR/ss_tcp_443"
   load_installer
   expect_fail check_ports
   assert_contains "$OUT" "Port 80 (tcp) is used by the program: nginx"
+  assert_contains "$OUT" "Port 443 (tcp) is used by the program: nginx"
   assert_contains "$OUT" "systemctl disable --now nginx"
+  assert_eq "$(grep -c 'systemctl disable --now nginx' <<<"$OUT")" 1 "the advice for both ports is given once"
   assert_not_contains "$OUT" "Traefik"
 }
 
@@ -254,8 +275,8 @@ test_packages_missing_qr_tool_is_not_fatal() {
   rm "$T/bin/qrencode"
   echo 100 >"$FAKE_DIR/rc_apt-get"
   load_installer
-  APT_UPDATED=1
-  expect_ok install_packages
+  # The package lists count as already refreshed.
+  APT_UPDATED=1 expect_ok install_packages
   assert_contains "$OUT" "The link is still shown as text"
 }
 

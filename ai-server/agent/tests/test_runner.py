@@ -6,6 +6,7 @@ import asyncio
 
 import pytest
 
+from app import runner as runner_module
 from app.db import Database
 from app.runner import MAX_QUEUED, QueueFull
 from helpers import FakeLLM, call, say
@@ -200,3 +201,77 @@ async def test_worker_loop_picks_up_tasks(make_services):
     worker.cancel()
     await asyncio.gather(worker, return_exceptions=True)
     assert sv.db.get_task(task_id)["result"] == "from the worker"
+
+
+async def until(condition, seconds: float = 5.0) -> None:
+    for _ in range(int(seconds / 0.005)):
+        if condition():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition not reached")
+
+
+async def test_a_running_background_task_waits_while_the_governor_holds_background_work(make_services, monkeypatch):
+    monkeypatch.setattr(runner_module, "IDLE_POLL", 0.01)
+    holder: dict = {}
+
+    def first_call(_body):
+        holder["sv"].governor.throttled = True            # the VPS starts being throttled now
+        return call("list_files", {})
+
+    llm = FakeLLM(first_call, say("interactive answer"), say("background finished"))
+    sv = holder["sv"] = await make_services(llm, cpu_governor=True, background_rest_ratio=0.0)
+    bg = sv.runner.submit("scheduled", "long job")
+    worker = asyncio.create_task(drain(sv))
+    await until(lambda: sv.runner.held == bg)
+    assert len(llm.requests) == 1 and sv.runner.queue_status()["held"] == bg
+    chat = sv.runner.submit("chat", "are you there?")     # interactive work is never held back
+    await until(lambda: sv.db.get_task(chat)["status"] == "done")
+    await asyncio.sleep(0.05)
+    assert len(llm.requests) == 2 and sv.db.get_task(bg)["status"] == "running"
+    sv.governor.throttled = False                          # throttling is over
+    await asyncio.wait_for(worker, 5)
+    task = sv.db.get_task(bg)
+    assert (task["status"], task["result"]) == ("done", "background finished")
+    assert any(s["t"] == "note" and "CPU governor" in s["text"] for s in task["steps"])
+    assert sv.runner.held is None and sv.runner.queue_status()["held"] is None
+
+
+async def test_cancelling_a_held_background_task_ends_it_at_once(make_services, monkeypatch):
+    monkeypatch.setattr(runner_module, "IDLE_POLL", 60.0)   # only the cancel itself may wake it up
+    holder: dict = {}
+
+    def first_call(_body):
+        holder["sv"].governor.throttled = True
+        return call("list_files", {})
+
+    llm = FakeLLM(first_call, say("must not be asked"))
+    sv = holder["sv"] = await make_services(llm, cpu_governor=True, background_rest_ratio=0.0)
+    bg = sv.runner.submit("scheduled", "long job")
+    worker = asyncio.create_task(drain(sv))
+    await until(lambda: sv.runner.held == bg)
+    assert sv.runner.cancel(bg) == "cancelling"
+    await asyncio.wait_for(worker, 2)
+    assert sv.db.get_task(bg)["status"] == "cancelled" and len(llm.requests) == 1
+
+
+async def test_pausing_does_not_use_up_the_background_time_limit(make_services, monkeypatch):
+    """The wait may be long and runs interactive tasks; the background task's own time
+    limit must neither expire during it nor cancel what runs inside it."""
+    monkeypatch.setattr(runner_module, "IDLE_POLL", 0.01)
+    sv = await make_services(FakeLLM(say("interactive answer")), cpu_governor=True, background_rest_ratio=0.0)
+    sv.governor.throttled = True
+    chat = sv.runner.submit("chat", "quick question")
+
+    async def release():
+        await asyncio.sleep(0.3)
+        sv.governor.throttled = False
+
+    releaser = asyncio.create_task(release())
+    async with asyncio.timeout(0.1) as timer:              # much shorter than the pause
+        before = timer.when()
+        note = await sv.runner._pause(1.0, hold=True, task_id=7, timer=timer)
+        assert timer.when() >= before + 0.25               # pushed back by the time spent pausing
+    await releaser
+    assert note and "CPU governor" in note
+    assert sv.db.get_task(chat)["status"] == "done"         # served inside the pause, not cancelled

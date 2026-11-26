@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
 # The real tar, except that creating an archive fails when
-# $FAKE_DIR/tar_fail exists (a full disk, for the backup tests).
+# $FAKE_DIR/tar_fail exists, and unpacking one fails half-way when
+# $FAKE_DIR/tar_x_fail exists (a full disk, for the backup and restore tests).
 if [ -e "$FAKE_DIR/tar_fail" ]; then
   case " $* " in
     *" -czf "*)
       echo "tar: write error: No space left on device" >&2
+      exit 2
+      ;;
+  esac
+fi
+if [ -e "$FAKE_DIR/tar_x_fail" ]; then
+  case " $* " in
+    *" -xzpf "*)
+      "${REAL_TAR:?}" "$@" --exclude='data/webui/*' 2>/dev/null
+      echo "tar: data/webui/webui.db: Cannot write: No space left on device" >&2
       exit 2
       ;;
   esac

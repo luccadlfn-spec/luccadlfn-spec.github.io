@@ -140,7 +140,7 @@ test_net_validators() {
   for v in chat.example.com a.b localhost srv123456.hstgr.cloud 203-0-113-10.sslip.io x; do
     valid_hostname "$v" || fail "'$v' should be a valid host name"
   done
-  for v in "" "-a.b" "a.b-" "a b" "http://a.b" "a/b" "a_b.c" 'a$b'; do
+  for v in "" "-a.b" "a.b-" "a b" "http://a.b" "a/b" "a_b.c" "a\$b"; do
     if valid_hostname "$v"; then fail "'$v' should not be a valid host name"; fi
   done
   for v in me@example.com first.last+tag@sub.example.org; do
@@ -153,9 +153,35 @@ test_net_validators() {
   assert_contains "$OUT" "does not look like an e-mail address"
 }
 
+test_options_can_come_from_the_environment() {
+  load_installer
+  ASSUME_YES=0
+  DRY_RUN=0
+  # As hostinger/post-install.sh passes them: no options on the command line.
+  MYAI_DOMAIN=Chat.Example.com MYAI_MODEL=fast MYAI_ADMIN_EMAIL=me@example.com MYAI_GOVERNOR=off \
+    MYAI_TLS_INTERNAL=1 MYAI_NO_HARDEN=1 MYAI_SKIP_MODEL_DOWNLOAD=1 MYAI_YES=1 MYAI_DRY_RUN=1 \
+    MYAI_DIR="$T/elsewhere" parse_args
+  assert_eq "$OPT_DOMAIN" chat.example.com
+  assert_eq "$OPT_MODEL" fast
+  assert_eq "$OPT_ADMIN_EMAIL" me@example.com
+  assert_eq "$OPT_GOVERNOR" off
+  assert_eq "$OPT_TLS_INTERNAL" 1 "MYAI_TLS_INTERNAL"
+  assert_eq "$OPT_NO_HARDEN" 1 "MYAI_NO_HARDEN"
+  assert_eq "$OPT_SKIP_MODEL" 1 "MYAI_SKIP_MODEL_DOWNLOAD"
+  assert_eq "$ASSUME_YES" 1 "MYAI_YES"
+  assert_eq "$DRY_RUN" 1 "MYAI_DRY_RUN"
+  assert_eq "$APP_DIR" "$T/elsewhere" "MYAI_DIR"
+  # The command line wins.
+  MYAI_MODEL=fast MYAI_DIR="$T/elsewhere" parse_args --model hauhau --dir "$APP"
+  assert_eq "$OPT_MODEL" hauhau
+  assert_eq "$APP_DIR" "$APP"
+  MYAI_GOVERNOR=maybe expect_fail parse_args
+  assert_contains "$OUT" "--governor must be on or off"
+}
+
 test_net_install_dir_must_be_sane() {
   local d
-  for d in / /opt relative/path "/opt/my ai" '/opt/$x' /opt/.. /opt/../etc /opt/./myai; do
+  for d in / /opt relative/path "/opt/my ai" "/opt/\$x" /opt/.. /opt/../etc /opt/./myai; do
     # load_installer passes its own --dir first; the one given here comes last and wins.
     expect_fail load_installer --dir "$d"
     assert_contains "$OUT" "cannot be used with --dir"

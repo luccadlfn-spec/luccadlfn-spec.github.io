@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 
 import pytest
 
@@ -73,6 +74,31 @@ def test_bearer_scheme_is_case_insensitive(sandbox):
         "POST", "/exec", body={"language": "bash", "code": "echo ok"}, headers={"Authorization": f"bearer {TOKEN}"}
     )
     assert status == 200 and payload["stdout"] == "ok\n"
+
+
+def test_exec_from_the_sandbox_itself_is_refused_even_with_the_token(make_sandbox):
+    # Docker hands the token to every process it starts in the container
+    # (health checks included), so a snippet can find it. Requests from the
+    # container itself are therefore refused; the agent calls from elsewhere.
+    box = make_sandbox(SANDBOX_ALLOW_LOCAL_EXEC="")
+    for token in (TOKEN, None):
+        status, _, payload = box.post_exec({"language": "bash", "code": "touch from-inside"}, token=token)
+        assert status == 403
+        assert "inside the sandbox" in payload["error"]
+    assert not (box.workdir / "from-inside").exists()
+    assert box.request("GET", "/healthz")[0] == 200  # the health check is a local request too
+
+
+def test_same_host_unit(server_module):
+    same = server_module._same_host
+    assert same("127.0.0.1", "127.0.0.1")
+    assert same("127.0.0.5", "172.20.0.3")  # any loopback address
+    assert same("::1", "::1")
+    assert same("::ffff:127.0.0.1", "::ffff:172.20.0.3")
+    assert same("172.20.0.3", "172.20.0.3")  # the container's own address on its network
+    assert same("not an address", "172.20.0.3")  # unknown: refuse
+    assert not same("172.20.0.2", "172.20.0.3")  # the agent's container
+    assert not same("::ffff:172.20.0.2", "::ffff:172.20.0.3")
 
 
 def test_no_configured_token_means_nobody_gets_in(make_sandbox):
@@ -216,8 +242,11 @@ def test_environment_is_minimal_and_has_no_token(sandbox):
     assert set(env) <= {
         "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "PYTHONPATH", "PYTHONUNBUFFERED",
         "PYTHONDONTWRITEBYTECODE", "PYTHONIOENCODING", "MPLBACKEND", "OMP_NUM_THREADS",
-        "OPENBLAS_NUM_THREADS", "TZ",
+        "OPENBLAS_NUM_THREADS", "TZ", "PYTHONNOUSERSITE", "SANDBOX_WORKSPACE",
     }  # fmt: skip
+    # Entries in PYTHONPATH come before the standard library: never the workspace.
+    assert str(sandbox.workdir) not in env["PYTHONPATH"].split(os.pathsep)
+    assert env["PYTHONNOUSERSITE"] == "1"
     bash_env = sandbox.run("bash", "env")["stdout"]
     assert TOKEN not in bash_env and "CANARY" not in bash_env
 
@@ -403,6 +432,66 @@ def test_parse_request_unit(server_module):
         parse(b'{"language": "sh", "code": "ls"}')
 
 
+def test_stop_requested_unit(server_module):
+    stop, info = server_module.stop_requested, types.SimpleNamespace
+    assert stop(info(si_pid=4321, si_code=0), as_init=False)  # outside a container: any sender
+    assert stop(info(si_pid=0, si_code=0), as_init=True)  # kill() from outside the container (docker stop)
+    assert stop(info(si_pid=0, si_code=-6), as_init=True)  # tgkill() from outside
+    assert not stop(info(si_pid=57, si_code=0), as_init=True)  # kill -TERM 1 from a snippet
+    assert not stop(info(si_pid=0, si_code=-1), as_init=True)  # rt_sigqueueinfo() with a made-up sender
+
+
+def test_memory_note_unit(server_module):
+    note = server_module._memory_note
+    assert note(3, 3, True) is None  # the counter shows no memory kill: a snippet's own kill -9
+    assert "ran out of" in note(3, 4, False)  # a child died of it even though the program exited normally
+    assert "most likely" in note(None, None, True)  # no counter: say what probably happened
+    assert note(None, None, False) is None
+
+
+def test_server_notes_stay_within_the_output_limit(server_module):
+    big = server_module.OutputBuffer()
+    big.add(b"x" * 100_000)
+    text = server_module.with_notes(big, ["[sandbox] before"], ["[sandbox] after"])
+    assert len(text) <= server_module.OUTPUT_LIMIT
+    assert text.startswith("[sandbox] before\nxxx") and text.endswith("xxx\n[sandbox] after\n")
+    assert "output truncated: 100000 bytes" in text
+    small = server_module.OutputBuffer()
+    small.add(b"no newline")
+    assert server_module.with_notes(small, [], ["[sandbox] note"]) == "no newline\n[sandbox] note\n"
+    assert server_module.with_notes(server_module.OutputBuffer(), [], []) == ""
+
+
+def test_empty_dir_unit(server_module, tmp_path):
+    top, outside = tmp_path / "scratch", tmp_path / "outside"
+    top.mkdir()
+    outside.mkdir()
+    (outside / "keep.txt").write_text("keep")
+    (top / "file").write_text("x")
+    (top / "link-to-outside").symlink_to(outside)  # removed, its target untouched
+    deep = top
+    for _ in range(1100):  # deeper than Python's recursion limit
+        deep = deep / "d"
+        deep.mkdir()
+    (deep / "bottom").write_text("y")
+    locked = top / "locked" / "inner"
+    locked.mkdir(parents=True)
+    (locked / "f").write_text("z")
+    locked.chmod(0)
+    locked.parent.chmod(0)
+    server_module._empty_dir(str(top))
+    assert list(top.iterdir()) == []
+    assert (outside / "keep.txt").read_text() == "keep"
+
+
+def test_default_disk_floor_unit(server_module, tmp_path):
+    guard = server_module.DiskGuard(str(tmp_path))
+    st = os.statvfs(tmp_path)
+    assert guard.enabled
+    assert guard.floor == max(5 * 1024**3, st.f_blocks * st.f_frsize // 20)
+    assert server_module.DiskGuard(str(tmp_path / "missing")).enabled is False
+
+
 # --------------------------------------------------------------------------
 # resource limits
 # --------------------------------------------------------------------------
@@ -473,12 +562,108 @@ def test_falls_back_to_an_in_memory_script_when_tmp_is_unusable(make_sandbox, tm
     assert box.run("bash", "sleep 30", timeout=0.5)["timed_out"] is True
 
 
-def test_missing_workspace_is_reported_not_fatal(make_sandbox, tmp_path):
+def test_missing_workspace_runs_in_tmp_and_says_so(make_sandbox, tmp_path):
+    # A 500 would reach the model only as "the sandbox refused the request".
     box = make_sandbox(SANDBOX_WORKDIR=str(tmp_path / "no-such-workspace"))
-    status, _, payload = box.post_exec({"language": "bash", "code": "echo hi"})
-    assert status == 500
-    assert "error" in payload
+    result = box.run("bash", "pwd; echo hi")
+    assert result["exit_code"] == 0
+    assert result["stdout"] == f"{box.tmpdir}\nhi\n"
+    assert result["stderr"].startswith("[sandbox] The workspace ")
+    assert "cannot be used" in result["stderr"] and str(box.tmpdir) in result["stderr"]
     assert box.request("GET", "/healthz")[0] == 200
+
+
+# --------------------------------------------------------------------------
+# the workspace: permissions, imports, disk space
+# --------------------------------------------------------------------------
+
+
+def test_a_chmod_of_the_workspace_is_repaired(make_unprivileged_sandbox):
+    # `chmod -R 644 .` takes the x bit off the workspace itself; without the
+    # repair no later run could even start in it (each was a 500).
+    box = make_unprivileged_sandbox()
+    result = box.run("bash", "echo data > keep.txt; chmod -R 644 . ; echo done")
+    assert "done" in result["stdout"]
+    result = box.run("bash", "pwd; cat keep.txt; touch new.txt && echo wrote")
+    assert result["exit_code"] == 0, result
+    assert result["stdout"] == f"{box.workdir}\ndata\nwrote\n"
+    assert "[sandbox] The workspace" in result["stderr"] and "given back" in result["stderr"]
+    assert box.workdir.stat().st_mode & 0o700 == 0o700
+    # Once repaired, runs are quiet again.
+    assert box.run("bash", "echo quiet")["stderr"] == ""
+
+
+def test_a_workspace_that_cannot_be_entered_falls_back_to_tmp(make_unprivileged_sandbox):
+    if os.geteuid() != 0:
+        pytest.skip("needs root to give the workspace to another owner")
+    box = make_unprivileged_sandbox()
+    os.chown(box.workdir, 0, 0)  # for example after a restore by root
+    box.workdir.chmod(0o700)
+    result = box.run("bash", "pwd; echo still-runs")
+    assert result["exit_code"] == 0
+    assert result["stdout"] == f"{box.tmpdir}\nstill-runs\n"
+    assert "cannot be used (permission denied)" in result["stderr"]
+
+
+PLANTED = {
+    "sitecustomize.py": "print('PLANTED sitecustomize')\n",
+    "usercustomize.py": "print('PLANTED usercustomize')\n",
+    "planted.pth": "import sys; print('PLANTED pth')\n",
+    "email.py": "raise ImportError('PLANTED email.py')\n",
+    "json.py": "raise ImportError('PLANTED json.py')\n",
+    "random.py": "raise ImportError('PLANTED random.py')\n",
+    "types.py": "raise ImportError('PLANTED types.py')\n",
+}
+
+
+def test_files_in_the_workspace_cannot_hijack_later_python_runs(make_sandbox):
+    box = make_sandbox()
+    for name, text in PLANTED.items():
+        (box.workdir / name).write_text(text)
+    # HOME is the temp directory: a per-user site directory there would be
+    # loaded by every later run as well.
+    user_site = box.tmpdir / ".local" / "lib" / f"python{sys.version_info[0]}.{sys.version_info[1]}" / "site-packages"
+    user_site.mkdir(parents=True)
+    (user_site / "usercustomize.py").write_text("print('PLANTED user site')\n")
+    (user_site / "planted.pth").write_text("import sys; print('PLANTED user pth')\n")
+    (box.workdir / "helper_mod.py").write_text("VALUE = 41\n")
+    code = "import json, random, tempfile, types, urllib.request\nimport helper_mod\nprint('answer', 6 * 7, helper_mod.VALUE + 1)"
+    result = box.run("python", code)
+    assert result["exit_code"] == 0, result
+    assert result["stdout"] == "answer 42 42\n"
+    assert "PLANTED" not in result["stdout"] + result["stderr"]
+    # Python started from bash, in another directory, finds workspace modules too.
+    result = box.run("bash", "cd /; python3 -c 'import helper_mod, urllib.request; print(helper_mod.VALUE)'")
+    assert (result["exit_code"], result["stdout"]) == (0, "41\n"), result
+    assert "PLANTED" not in result["stdout"] + result["stderr"]
+
+
+def test_a_nearly_full_disk_stops_writing_but_not_cleaning_up(make_sandbox, tmp_path):
+    # A floor far above what is free: for the guard the disk is already full.
+    st = os.statvfs(tmp_path)
+    box = make_sandbox(SANDBOX_MIN_FREE_MB=str(st.f_bavail * st.f_frsize // MIB + 100_000))
+    result = box.run("bash", "echo hi")
+    assert (result["exit_code"], result["stdout"]) == (0, "hi\n")
+    assert result["stderr"].startswith("[sandbox] Warning: the server's disk is almost full")
+    (box.workdir / "old.bin").write_bytes(b"x" * 2_000_000)
+    result = box.run("bash", "rm old.bin && echo removed")
+    assert (result["exit_code"], result["stdout"]) == (0, "removed\n")
+    fill = (
+        "import os, time\n"
+        "with open('fill.bin', 'wb') as f:\n"
+        "    for _ in range(30):\n"
+        "        f.write(b'x' * 4_000_000); f.flush(); os.fsync(f.fileno()); time.sleep(0.03)\n"
+        "print('wrote everything')\n"
+    )
+    try:
+        result = box.run("python", fill, timeout=60)
+        written = (box.workdir / "fill.bin").stat().st_size
+    finally:
+        (box.workdir / "fill.bin").unlink(missing_ok=True)
+    assert result["exit_code"] == -signal.SIGKILL and result["timed_out"] is False, result
+    assert "wrote everything" not in result["stdout"]
+    assert "[sandbox] Stopped: the server's disk is almost full" in result["stderr"]
+    assert written < 100_000_000
 
 
 # --------------------------------------------------------------------------
