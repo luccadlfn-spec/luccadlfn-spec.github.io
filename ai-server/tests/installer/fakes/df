@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# The real df, unless $FAKE_DIR/df_avail_kb gives the free space to report.
+if [ -s "$FAKE_DIR/df_avail_kb" ]; then
+  echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
+  echo "/dev/fake 999999999 1 $(cat "$FAKE_DIR/df_avail_kb") 1% /"
+  exit 0
+fi
+exec "${REAL_DF:?}" "$@"

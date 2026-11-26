@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<meta name="color-scheme" content="light dark">
+<title>Agent</title>
+<style nonce="__NONCE__">
+:root {
+  --bg: #f4f5f7; --card: #ffffff; --text: #1b1f24; --muted: #5f6b7a; --line: #dde1e6;
+  --accent: #2456c9; --accent-text: #ffffff; --ok: #1a7f45; --warn: #a15c00; --bad: #b3261e;
+  --field: #ffffff; --code: #f0f2f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111418; --card: #1a1f25; --text: #e6e9ed; --muted: #9aa5b1; --line: #2c333c;
+    --accent: #7aa2ff; --accent-text: #0d1117; --ok: #5bd08a; --warn: #f0b354; --bad: #ff8a80;
+    --field: #12161b; --code: #12161b;
+  }
+}
+* { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+main { max-width: 860px; margin: 0 auto; padding: 12px 12px 48px; }
+header { display: flex; align-items: center; gap: 10px; padding: 10px 2px 14px; }
+header h1 { font-size: 1.25rem; margin: 0; flex: 1; }
+h2 { font-size: 1rem; margin: 0 0 10px; }
+section { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px; margin-bottom: 14px; }
+.muted { color: var(--muted); }
+.small { font-size: .85rem; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; }
+.tile { border: 1px solid var(--line); border-radius: 10px; padding: 10px; min-width: 0; }
+.tile b { display: block; font-size: .8rem; color: var(--muted); font-weight: 600; margin-bottom: 2px; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+input, textarea, button { font: inherit; color: inherit; }
+input[type=text], input[type=password], textarea { width: 100%; padding: 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--field); }
+textarea { min-height: 84px; resize: vertical; }
+button { padding: 9px 14px; border-radius: 8px; border: 1px solid var(--line); background: transparent;
+  cursor: pointer; min-height: 40px; }
+button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .55; cursor: default; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.row .grow { flex: 1; min-width: 240px; }
+label.check { display: inline-flex; gap: 6px; align-items: center; }
+ul.list { list-style: none; margin: 0; padding: 0; }
+ul.list > li { border-top: 1px solid var(--line); padding: 10px 0; }
+ul.list > li:first-child { border-top: 0; padding-top: 0; }
+.head { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; cursor: pointer; }
+.head .title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { font-size: .75rem; padding: 1px 7px; border-radius: 999px; border: 1px solid var(--line); white-space: nowrap; }
+pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--code); border: 1px solid var(--line);
+  border-radius: 8px; padding: 10px; margin: 8px 0; font: .85rem/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+  max-height: 60vh; overflow: auto; }
+.steps { margin: 6px 0 0; padding-left: 18px; }
+.steps li { margin: 3px 0; overflow-wrap: anywhere; }
+#msg { min-height: 1.3em; margin: 0 2px 8px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Agent</h1>
+    <span id="clock" class="muted small"></span>
+    <button id="logout" hidden>Sign out</button>
+  </header>
+  <p id="msg" class="small" role="status"></p>
+
+  <section id="login" hidden>
+    <h2>Sign in</h2>
+    <form id="loginForm">
+      <input type="password" id="password" placeholder="Dashboard password" autocomplete="current-password" required>
+      <div class="row"><button class="primary" type="submit">Sign in</button></div>
+    </form>
+    <p class="muted small">The password is the one shown at the end of the installation (also in <code>myai creds</code>).</p>
+  </section>
+
+  <div id="app" hidden>
+    <section>
+      <h2>Status</h2>
+      <div class="grid">
+        <div class="tile"><b>Model</b><span id="stModel">-</span></div>
+        <div class="tile"><b>Queue</b><span id="stQueue">-</span></div>
+        <div class="tile"><b>CPU governor</b><span id="stCpu">-</span></div>
+        <div class="tile"><b>Telegram</b><span id="stTg">-</span></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Run a task</h2>
+      <form id="taskForm">
+        <textarea id="taskPrompt" placeholder="What should the agent do?" maxlength="16000" required></textarea>
+        <div class="row">
+          <button class="primary" type="submit">Run</button>
+          <label class="check small"><input type="checkbox" id="taskBg"> Low priority (background)</label>
+        </div>
+      </form>
+    </section>
+
+    <section>
+      <h2>Recent tasks</h2>
+      <ul id="tasks" class="list"><li class="muted">Loading…</li></ul>
+    </section>
+
+    <section>
+      <h2>Schedules</h2>
+      <ul id="schedules" class="list"><li class="muted">Loading…</li></ul>
+      <form id="schedForm">
+        <div class="row">
+          <input class="grow" type="text" id="schedWhen" placeholder="When: 0 8 * * *  ·  in 2h  ·  2027-01-31 09:00" maxlength="100" required>
+          <input class="grow" type="text" id="schedName" placeholder="Name (optional)" maxlength="80">
+        </div>
+        <div class="row"><textarea id="schedPrompt" placeholder="What should run?" maxlength="4000" required></textarea></div>
+        <div class="row"><button type="submit">Add schedule</button>
+          <span id="schedHint" class="muted small"></span></div>
+      </form>
+    </section>
+
+    <section>
+      <h2>Notes</h2>
+      <ul id="notes" class="list"><li class="muted">Loading…</li></ul>
+    </section>
+  </div>
+</main>
+<script nonce="__NONCE__">
+"use strict";
+(function () {
+  const $ = (id) => document.getElementById(id);
+  const open = new Set();          // ids of expanded tasks
+  const details = new Map();       // id -> last fetched task
+  let signedIn = false, timer = null, tick = 0;
+
+  function el(tag, props, ...kids) {
+    const node = document.createElement(tag);
+    for (const [k, v] of Object.entries(props || {})) {
+      if (k === "class") node.className = v; else if (k === "text") node.textContent = v; else node[k] = v;
+    }
+    for (const kid of kids) if (kid != null) node.append(kid);
+    return node;
+  }
+  function say(text, bad) { const m = $("msg"); m.textContent = text || ""; m.className = "small " + (bad ? "bad" : "muted"); }
+  function when(ts) { return ts ? new Date(ts * 1000).toLocaleString() : "-"; }
+
+  async function api(method, path, body) {
+    const opts = { method, credentials: "same-origin", headers: { "Content-Type": "application/json" } };
+    if (body !== undefined) opts.body = JSON.stringify(body);
+    const resp = await fetch("api/" + path, opts);
+    let data = {};
+    try { data = await resp.json(); } catch (e) { /* empty or non-JSON body */ }
+    if (resp.status === 401 && path !== "login") { show(false); throw new Error("Please sign in."); }
+    if (!resp.ok) throw new Error(data.error || ("Request failed (" + resp.status + ")"));
+    return data;
+  }
+
+  function show(authed) {
+    signedIn = authed;
+    $("login").hidden = authed; $("app").hidden = !authed; $("logout").hidden = !authed;
+    if (!authed) $("password").focus();
+  }
+
+  // ---- status ----
+  function renderStatus(st) {
+    const m = st.model || {}, q = st.queue || {}, g = st.governor || {}, t = st.telegram || {};
+    const model = $("stModel");
+    model.textContent = m.state === "ready" ? "Ready" : (m.state === "loading" ? "Loading the model…" : "Not reachable");
+    model.className = m.state === "ready" ? "ok" : (m.state === "loading" ? "warn" : "bad");
+    $("stQueue").textContent = (q.queued || 0) + " waiting, " + ((q.running || 0)) + " running" +
+      (q.held ? " · task #" + q.held + " is paused by the CPU governor" : "");
+    const cpu = $("stCpu");
+    if (!g.enabled) { cpu.textContent = "Off"; cpu.className = "muted"; }
+    else {
+      cpu.textContent = (g.background_allowed ? "OK" : "Background work paused") + " · busy " + g.busy_pct +
+        "% · steal " + g.steal_pct + "%" + (g.credits_pct == null ? "" : " · credits ≈ " + g.credits_pct + "%");
+      cpu.className = g.throttled ? "bad" : (g.background_allowed ? "ok" : "warn");
+      cpu.title = g.reason || "";
+    }
+    const tg = $("stTg");
+    tg.textContent = !t.enabled ? "Not set up" : (t.error ? "Problem: " + t.error : (t.owners ? "Connected" : "Waiting for /pair"));
+    tg.className = !t.enabled ? "muted" : (t.error ? "bad" : (t.owners ? "ok" : "warn"));
+    $("clock").textContent = (st.settings && st.settings.timezone) || "";
+  }
+
+  // ---- tasks ----
+  function stepLine(s) {
+    if (s.t === "llm") {
+      return "Model call " + s.n + ": " + s.s + " s, " + (s.in == null ? "?" : s.in) + " prompt tokens" +
+        (s.cached ? " (" + s.cached + " cached)" : "") + ", " + (s.out == null ? "?" : s.out) + " generated" +
+        (s.think ? ", thinking on" : "");
+    }
+    if (s.t === "tool") return s.name + " " + s.args + "  →  " + (s.ok ? "ok" : "failed") + " in " + s.s + " s: " + s.out;
+    return s.text || "";
+  }
+  function taskDetail(task) {
+    const box = el("div", {});
+    box.append(el("div", { class: "muted small", text: "Created " + when(task.created_at) +
+      (task.finished_at ? " · finished " + when(task.finished_at) : "") }));
+    box.append(el("pre", { text: task.prompt }));
+    if (task.result) box.append(el("pre", { text: task.result }));
+    if (task.error) box.append(el("div", { class: "bad small", text: "Error: " + task.error }));
+    if (task.steps && task.steps.length) {
+      const ol = el("ul", { class: "steps small muted" });
+      for (const s of task.steps) ol.append(el("li", { text: stepLine(s) }));
+      box.append(ol);
+    }
+    if (task.status === "queued" || task.status === "running") {
+      const b = el("button", { class: "danger", text: "Cancel", type: "button" });
+      b.addEventListener("click", () => act(() => api("POST", "tasks/" + task.id + "/cancel", {}), "Cancel requested."));
+      box.append(el("div", { class: "row" }, b));
+    }
+    return box;
+  }
+  function renderTasks(tasks) {
+    const ul = $("tasks"); ul.replaceChildren();
+    if (!tasks.length) { ul.append(el("li", { class: "muted", text: "No tasks yet." })); return; }
+    for (const t of tasks) {
+      const cls = t.status === "done" ? "ok" : (t.status === "error" ? "bad" : (t.status === "cancelled" ? "muted" : "warn"));
+      const head = el("div", { class: "head" },
+        el("span", { class: "muted small", text: "#" + t.id }),
+        el("span", { class: "badge " + cls, text: t.status }),
+        el("span", { class: "badge", text: t.name ? t.kind + ": " + t.name : t.kind }),
+        el("span", { class: "title", text: t.prompt }));
+      const li = el("li", {}, head);
+      head.addEventListener("click", () => { open.has(t.id) ? open.delete(t.id) : open.add(t.id); refreshTasks(); });
+      if (open.has(t.id)) li.append(taskDetail(details.get(t.id) || t));
+      ul.append(li);
+    }
+  }
+  async function refreshTasks() {
+    const data = await api("GET", "tasks?limit=20");
+    for (const t of data.tasks) {
+      const known = details.get(t.id);
+      if (open.has(t.id) && (!known || known.status !== t.status || t.status === "running")) {
+        try { details.set(t.id, await api("GET", "tasks/" + t.id)); } catch (e) { /* shown next round */ }
+      }
+    }
+    renderTasks(data.tasks);
+  }
+
+  // ---- schedules ----
+  async function refreshSchedules() {
+    const data = await api("GET", "schedules");
+    const ul = $("schedules"); ul.replaceChildren();
+    $("schedHint").textContent = "Up to " + data.limit + " schedules, at most every " + data.min_interval_minutes + " minutes.";
+    if (!data.schedules.length) ul.append(el("li", { class: "muted", text: "No schedules." }));
+    for (const s of data.schedules) {
+      const toggle = el("button", { type: "button", text: s.enabled ? "Pause" : "Resume" });
+      toggle.addEventListener("click", () => act(() => api("PATCH", "schedules/" + s.id, { enabled: !s.enabled }), "Saved.", refreshSchedules));
+      const del = el("button", { type: "button", class: "danger", text: "Delete" });
+      del.addEventListener("click", () => { if (confirm("Delete this schedule?")) act(() => api("DELETE", "schedules/" + s.id), "Deleted.", refreshSchedules); });
+      ul.append(el("li", {},
+        el("div", {}, el("strong", { text: s.name }), el("span", { class: "muted small", text: "  " + s.spec + (s.enabled ? " · next " + s.next_run_text : " · paused") })),
+        el("div", { class: "small", text: s.prompt }),
+        el("div", { class: "row" }, toggle, del)));
+    }
+  }
+
+  // ---- notes ----
+  async function refreshNotes() {
+    const data = await api("GET", "notes");
+    const ul = $("notes"); ul.replaceChildren();
+    if (!data.notes.length) ul.append(el("li", { class: "muted", text: "The agent has not saved any notes." }));
+    for (const n of data.notes) {
+      const del = el("button", { type: "button", class: "danger", text: "Delete" });
+      del.addEventListener("click", () => act(() => api("DELETE", "notes/" + n.id), "Deleted.", refreshNotes));
+      ul.append(el("li", {}, el("div", { text: n.text }),
+        el("div", { class: "row" }, el("span", { class: "muted small", text: when(n.created_at) }), del)));
+    }
+  }
+
+  // ---- plumbing ----
+  async function act(fn, done, after) {
+    try { await fn(); say(done); await (after || refreshTasks)(); } catch (e) { say(e.message, true); }
+  }
+  async function refresh(full) {
+    if (!signedIn && tick > 0) return;
+    try {
+      renderStatus(await api("GET", "status"));
+      if (!signedIn) show(true);
+      await refreshTasks();
+      if (full || tick % 6 === 0) { await refreshSchedules(); await refreshNotes(); }
+      tick += 1;
+    } catch (e) { if (signedIn) say(e.message, true); else tick += 1; }
+  }
+
+  $("loginForm").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    try { await api("POST", "login", { password: $("password").value }); $("password").value = ""; say(""); show(true); tick = 0; await refresh(true); }
+    catch (e) { say(e.message, true); }
+  });
+  $("logout").addEventListener("click", async () => { try { await api("POST", "logout", {}); } catch (e) { /* ignore */ } show(false); say("Signed out."); });
+  $("taskForm").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    act(async () => { await api("POST", "tasks", { prompt: $("taskPrompt").value, background: $("taskBg").checked }); $("taskPrompt").value = ""; }, "Task queued.");
+  });
+  $("schedForm").addEventListener("submit", (ev) => {
+    ev.preventDefault();
+    act(async () => {
+      await api("POST", "schedules", { when: $("schedWhen").value, prompt: $("schedPrompt").value, name: $("schedName").value || null });
+      $("schedWhen").value = ""; $("schedPrompt").value = ""; $("schedName").value = "";
+    }, "Schedule added.", refreshSchedules);
+  });
+
+  show(false);
+  refresh(true);
+  timer = setInterval(() => { if (signedIn && !document.hidden) refresh(false); }, 5000);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,1215 @@
+#!/usr/bin/env bash
+# myai-lib.sh: functions shared by install.sh and bin/myai.
+#
+# This file is sourced, never run. Loading it changes no shell option and
+# does nothing by itself. The caller sets APP_DIR (where the app lives, for
+# example /opt/myai) before calling anything that touches files or Docker.
+
+: "${DRY_RUN:=0}"
+: "${ASSUME_YES:=0}"
+# Test hook: a directory that stands in for "/" for the system files this code
+# reads and writes (/proc, /etc, ...). Empty on a real server.
+: "${MYAI_SYSROOT:=}"
+# Test hook: where model files and their checksums are fetched from.
+: "${MYAI_HF_BASE:=https://huggingface.co}"
+# Seconds between progress lines, between health polls, between download tries.
+: "${MYAI_PROGRESS_SECS:=15}"
+: "${MYAI_POLL_SECS:=5}"
+: "${MYAI_RETRY_SECS:=10}"
+: "${MYAI_DOWNLOAD_TRIES:=8}"
+
+MYAI_SERVICES="llm agent sandbox webui searxng caddy"
+
+# ------------------------------------------------------------------ output ---
+
+say()  { printf '%s\n' "$*"; }
+note() { printf '  %s\n' "$*"; }
+warn() { printf '  Warning: %s\n' "$*" >&2; }
+
+# die "what went wrong" ["what to do next" ...]
+die() {
+  local line
+  printf '\nStopped: %s\n' "$1" >&2
+  shift
+  for line in "$@"; do printf '  %s\n' "$line" >&2; done
+  # shellcheck disable=SC2034  # read by the exit handler of the script that sourced this file
+  MYAI_DIE_SHOWN=1
+  exit 1
+}
+
+# The number of lines in TEXT that are not empty.
+count_lines() { printf '%s\n' "$1" | grep -c .; }
+
+# 21166758016 -> "21.2 GB" (decimal, as download pages show it)
+fmt_gb() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f GB", b / 1000000000 }'; }
+
+# 135 -> "2 min 15 s"
+fmt_duration() {
+  local s=${1:-0}
+  if [ "$s" -lt 60 ]; then
+    printf '%d s' "$s"
+  else
+    printf '%d min %02d s' $((s / 60)) $((s % 60))
+  fi
+}
+
+# Quote a command line for display only.
+quote_cmd() {
+  local arg out=""
+  for arg in "$@"; do
+    if [[ $arg =~ ^[A-Za-z0-9_./:=@%+,-]+$ ]]; then
+      out+="$arg "
+    else
+      out+="'${arg//\'/\'\\\'\'}' "
+    fi
+  done
+  printf '%s' "${out% }"
+}
+
+# ----------------------------------------------- doing or only showing ---
+
+# run CMD...: run it, or with --dry-run only print it.
+run() {
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  would run: %s\n' "$(quote_cmd "$@")"
+    return 0
+  fi
+  "$@"
+}
+
+# write_file PATH MODE: content from stdin. Written through a temporary file
+# so a crash never leaves half a file behind.
+write_file() {
+  local path=$1 mode=$2 tmp
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  would write: %s (mode %s)\n' "$path" "$mode"
+    sed 's/^/      | /'
+    return 0
+  fi
+  mkdir -p "$(dirname "$path")" || return 1
+  tmp=$(mktemp "$path.XXXXXX") || return 1
+  if cat >"$tmp" && chmod "$mode" "$tmp" && mv -f "$tmp" "$path"; then
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Same, but leaves a file alone that already has this content. Sets
+# FILE_CHANGED to 1 when the file was (or would be) written, else 0.
+write_file_if_changed() {
+  local path=$1 mode=$2 content
+  content=$(cat)
+  FILE_CHANGED=0
+  if [ -f "$path" ] && [ "$content" = "$(cat "$path")" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC2034  # read by the caller
+  FILE_CHANGED=1
+  printf '%s\n' "$content" | write_file "$path" "$mode"
+}
+
+# Add LINE to FILE unless the file already has exactly that line.
+append_line_once() {
+  local file=$1 line=$2
+  if [ -f "$file" ] && grep -qxF -- "$line" "$file"; then
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    printf '  would add to %s: %s\n' "$file" "$line"
+    return 0
+  fi
+  printf '%s\n' "$line" >>"$file"
+}
+
+# ----------------------------------------------------------------- asking ---
+
+# True when a question can be put to a person: not --yes, not --dry-run, and
+# a terminal exists (the script itself may arrive on stdin from curl).
+have_tty() { { : </dev/tty; } 2>/dev/null; }
+
+can_ask() {
+  [ "$ASSUME_YES" != 1 ] && [ "$DRY_RUN" != 1 ] && have_tty
+}
+
+# ask "question " "default": prints the answer. Gives up after five minutes
+# and uses the default, so an unattended run never hangs.
+ask() {
+  local reply=""
+  printf '%s' "$1" >/dev/tty
+  IFS= read -r -t 300 reply </dev/tty || reply=""
+  printf '%s\n' "${reply:-$2}"
+}
+
+# confirm "question": true for yes. --yes answers yes; without a terminal the
+# answer is no.
+confirm() {
+  local answer
+  if [ "$ASSUME_YES" = 1 ]; then return 0; fi
+  if ! can_ask; then return 1; fi
+  answer=$(ask "$1 [y/N] " n)
+  case "$answer" in
+    y | Y | yes | Yes | YES) return 0 ;;
+  esac
+  return 1
+}
+
+# ------------------------------------------------------- the settings file ---
+
+env_file() { printf '%s\n' "${ENV_FILE:-$APP_DIR/.env}"; }
+
+# Keys whose values are never printed.
+is_secret_key() {
+  case "$1" in
+    *_KEY | *_TOKEN | *_SECRET | *_PASSWORD | PAIRING_CODE) return 0 ;;
+  esac
+  return 1
+}
+
+# env_get KEY [FILE]: prints the value. Fails when the key is not in the file.
+# The file is parsed, never executed.
+env_get() {
+  local key=$1 file=${2:-} line val
+  [ -n "$file" ] || file=$(env_file)
+  [ -f "$file" ] || return 1
+  line=$(grep -m1 -E "^${key}=" "$file") || return 1
+  val=${line#*=}
+  val=${val%$'\r'}
+  case "$val" in
+    \'*\')
+      val=${val#\'}
+      val=${val%\'}
+      ;;
+    \"*\")
+      val=${val#\"}
+      val=${val%\"}
+      ;;
+  esac
+  printf '%s\n' "$val"
+}
+
+env_has() { env_get "$1" "${2:-}" >/dev/null 2>&1; }
+
+# The settings file holds every secret, so only root may read it (mode 600).
+# A copy made by hand from .env.example usually gets 644.
+secure_env_file() {
+  local file mode
+  file=$(env_file)
+  [ -f "$file" ] || return 0
+  mode=$(stat -c %a -- "$file" 2>/dev/null) || return 0
+  case "$mode" in
+    *00) return 0 ;; # nobody but the owner can read it
+  esac
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would make $file readable by root only (its mode is $mode)"
+    return 0
+  fi
+  if chmod 600 -- "$file"; then
+    warn "$file could be read by other users of this server (mode $mode). It is now readable by root only."
+  else
+    warn "$file can be read by other users of this server (mode $mode). Fix it with: chmod 600 $file"
+  fi
+}
+
+# How a value is written in the file: as it is when it is made of harmless
+# characters, otherwise in single quotes (Docker Compose reads both).
+env_quote() {
+  local value=$1
+  case "$value" in
+    *$'\n'* | *\'*) return 1 ;;
+  esac
+  if [[ $value =~ ^[A-Za-z0-9_.,:@/+=%~-]*$ ]]; then
+    printf '%s\n' "$value"
+  else
+    printf "'%s'\n" "$value"
+  fi
+}
+
+# env_set KEY VALUE [FILE]: replace the key's line, or add one. Every other
+# line stays as it is. The file keeps mode 600.
+env_set() {
+  local key=$1 value=$2 file=${3:-} quoted tmp
+  [ -n "$file" ] || file=$(env_file)
+  case "$key" in
+    '' | *[!A-Za-z0-9_]*) die "Internal error: '$key' is not a valid settings name." ;;
+  esac
+  quoted=$(env_quote "$value") ||
+    die "The value for $key cannot be stored: it contains a quote character or a line break." \
+      "Use a value without those characters."
+  if [ "$DRY_RUN" = 1 ]; then
+    if is_secret_key "$key"; then
+      note "would set $key=<hidden> in $file"
+    else
+      note "would set $key=$quoted in $file"
+    fi
+    return 0
+  fi
+  if [ ! -f "$file" ]; then
+    (umask 077 && : >"$file")
+  fi
+  tmp=$(mktemp "$file.XXXXXX")
+  # The value travels through the environment so that awk does not interpret
+  # backslashes or "&" in it.
+  if ! K=$key V=$quoted awk '
+      BEGIN { k = ENVIRON["K"]; v = ENVIRON["V"]; done = 0 }
+      index($0, k "=") == 1 { if (!done) print k "=" v; done = 1; next }
+      { print }
+      END { if (!done) print k "=" v }' "$file" >"$tmp"; then
+    rm -f "$tmp"
+    die "Could not update $file." "Check that the disk is not full: df -h"
+  fi
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$file"
+}
+
+# ----------------------------------------------------------- data folders ---
+
+# The folders under DATA_DIR with their owners: the models, the web data and
+# the certificates belong to root; the agent and the sandbox run as user
+# 10001 and share the workspace. A folder that exists gets the right owner
+# and mode; what is inside it is not touched.
+make_data_dirs() { # DATA
+  run install -d -m 755 -o root -g root "$1" "$1/models" "$1/webui" \
+    "$1/caddy" "$1/caddy/data" "$1/caddy/config" &&
+    run install -d -m 750 -o 10001 -g 10001 "$1/agent" "$1/workspace"
+}
+
+# -------------------------------------------------------- model catalogue ---
+# config/models.conf: id|min_ram_gb|hf_repo|file|bytes|description
+
+catalog_file() { printf '%s\n' "${MODELS_CONF:-$APP_DIR/config/models.conf}"; }
+
+catalog_lines() {
+  local file
+  file=$(catalog_file)
+  [ -f "$file" ] || return 1
+  grep -v -E '^[[:space:]]*(#|$)' "$file" || true
+}
+
+# catalog_field ID N: field N (1-6) of the entry. Fails for an unknown id.
+catalog_field() {
+  catalog_lines | awk -F'|' -v id="$1" -v n="$2" '
+    $1 == id && !found { print $n; found = 1 }
+    END { exit !found }'
+}
+
+catalog_ids() { catalog_lines | awk -F'|' '{ print $1 }'; }
+
+# True when a server with RAM_KB of memory can run a model that asks for
+# MIN_GB. A "32 GB" server reports a little less than 32 GiB (the kernel keeps
+# some, and some providers count in decimal GB), so 93% of the figure counts.
+ram_fits() {
+  awk -v kb="$1" -v gb="$2" 'BEGIN { exit !(kb >= gb * 1048576 * 0.93) }'
+}
+
+# catalog_pick_for_ram RAM_KB: the first entry, in file order, that fits.
+catalog_pick_for_ram() {
+  catalog_lines | awk -F'|' -v kb="$1" '
+    !found && kb >= $2 * 1048576 * 0.93 { print $1; found = 1 }
+    END { exit !found }'
+}
+
+# --------------------------------------------------------------- hardware ---
+
+hw_vcpus() {
+  local n
+  n=$(grep -c -E '^processor[[:space:]]*:' "$MYAI_SYSROOT/proc/cpuinfo" 2>/dev/null) || n=0
+  if [ "$n" -lt 1 ]; then
+    n=$(nproc 2>/dev/null) || n=1
+  fi
+  printf '%s\n' "$n"
+}
+
+hw_has_avx2() { grep -qw avx2 "$MYAI_SYSROOT/proc/cpuinfo" 2>/dev/null; }
+
+hw_ram_kb() {
+  awk '$1 == "MemTotal:" { print $2; found = 1 } END { exit !found }' "$MYAI_SYSROOT/proc/meminfo"
+}
+
+fmt_ram() { awk -v kb="${1:-0}" 'BEGIN { printf "%.1f GB", kb / 1048576 }'; }
+
+# Threads for generating text: three quarters of the vCPUs, rounded, at least
+# 2, never more than there are. The rest stays free for the other services.
+compute_threads() {
+  local n=$1 t
+  t=$(((3 * n + 2) / 4))
+  if [ "$t" -lt 2 ]; then t=2; fi
+  if [ "$t" -gt "$n" ]; then t=$n; fi
+  printf '%s\n' "$t"
+}
+
+# True on a machine that is run by systemd (not inside a plain container).
+has_systemd() { [ -d "$MYAI_SYSROOT/run/systemd/system" ]; }
+
+# One reading of the "cpu" line of /proc/stat: "total steal idle" in ticks.
+cpu_sample() {
+  awk '$1 == "cpu" { print $2 + $3 + $4 + $5 + $6 + $7 + $8 + $9, $9, $5 + $6; exit }' \
+    "$MYAI_SYSROOT/proc/stat"
+}
+
+# cpu_percentages "total steal idle" "total steal idle": prints "steal busy"
+# in percent for the time between two readings.
+cpu_percentages() {
+  awk -v a="$1" -v b="$2" 'BEGIN {
+    split(a, x, " "); split(b, y, " ")
+    dt = y[1] - x[1]
+    if (dt <= 0) { print "0.0 0.0"; exit }
+    steal = (y[2] - x[2]) * 100 / dt
+    busy = (dt - (y[3] - x[3]) - (y[2] - x[2])) * 100 / dt
+    if (busy < 0) busy = 0
+    printf "%.1f %.1f\n", steal, busy
+  }'
+}
+
+# ---------------------------------------------------------------- network ---
+
+valid_hostname() {
+  [[ ${1:-} =~ ^[A-Za-z0-9]([A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$ ]]
+}
+
+valid_email() {
+  [[ ${1:-} =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]
+}
+
+is_ipv4() { [[ ${1:-} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; }
+
+# True for an IPv4 address that can be reached from the internet (not
+# private, loopback, link-local, carrier NAT, multicast or reserved).
+is_public_ipv4() {
+  local a b c d
+  [[ ${1:-} =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  a=$((10#${BASH_REMATCH[1]}))
+  b=$((10#${BASH_REMATCH[2]}))
+  c=$((10#${BASH_REMATCH[3]}))
+  d=$((10#${BASH_REMATCH[4]}))
+  if [ "$a" -gt 255 ] || [ "$b" -gt 255 ] || [ "$c" -gt 255 ] || [ "$d" -gt 255 ]; then return 1; fi
+  if [ "$a" -eq 0 ] || [ "$a" -eq 10 ] || [ "$a" -eq 127 ] || [ "$a" -ge 224 ]; then return 1; fi
+  if [ "$a" -eq 100 ] && [ "$b" -ge 64 ] && [ "$b" -le 127 ]; then return 1; fi
+  if [ "$a" -eq 169 ] && [ "$b" -eq 254 ]; then return 1; fi
+  if [ "$a" -eq 172 ] && [ "$b" -ge 16 ] && [ "$b" -le 31 ]; then return 1; fi
+  if [ "$a" -eq 192 ] && [ "$b" -eq 168 ]; then return 1; fi
+  return 0
+}
+
+# The full name of this machine, lower case.
+machine_fqdn() {
+  local name
+  name=$(hostname -f 2>/dev/null) || name=$(hostname 2>/dev/null) || name=""
+  printf '%s\n' "${name,,}"
+}
+
+# This machine's public IPv4 address. Fails when none can be found.
+#   1. the address it uses to reach the internet, when that one is public;
+#   2. otherwise (behind NAT) the address a public resolver sees.
+detect_public_ipv4() {
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "src") { print $(i + 1); exit } }') || ip=""
+  if is_public_ipv4 "$ip"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  ip=$(dig +short +time=3 +tries=1 TXT CH whoami.cloudflare @1.1.1.1 2>/dev/null |
+    tr -d '"' | awk 'NR == 1') || ip=""
+  if is_public_ipv4 "$ip"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  ip=$(curl -4 -fsS --max-time 8 https://icanhazip.com 2>/dev/null | tr -d '[:space:]') || ip=""
+  if is_public_ipv4 "$ip"; then
+    printf '%s\n' "$ip"
+    return 0
+  fi
+  return 1
+}
+
+# The addresses public DNS has for NAME. Asks 1.1.1.1 directly: the machine's
+# own resolver would answer from /etc/hosts.
+dns_records() { # TYPE NAME
+  dig +short +time=3 +tries=2 "$1" "$2" @1.1.1.1 2>/dev/null | grep -E '^[0-9a-fA-F:.]+$' || true
+}
+
+# True when public DNS says NAME is at the IPv4 address IP.
+dns_points_to() {
+  dns_records A "$1" | grep -qxF -- "$2"
+}
+
+# port_users tcp|udp PORT: the programs listening there, one per line
+# ("?" when the name cannot be read).
+port_users() {
+  local flags=-Hltnp
+  if [ "$1" = udp ]; then flags=-Hlunp; fi
+  ss "$flags" "sport = :$2" 2>/dev/null | awk '
+    {
+      if (match($0, /users:\(\("[^"]+"/)) print substr($0, RSTART + 9, RLENGTH - 10)
+      else print "?"
+    }' | sort -u
+}
+
+# The Docker container that publishes a port, as "name (image)".
+port_container() { # PORT PROTO
+  command -v docker >/dev/null 2>&1 || return 0
+  docker ps --filter "publish=$1/$2" --format '{{.Names}} ({{.Image}})' 2>/dev/null | awk 'NR == 1'
+}
+
+# True when the port is held by this stack's own proxy (the installer run again, or a health check).
+port_is_ours() { # PORT PROTO
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --filter "publish=$1/$2" --filter "label=com.docker.compose.project=myai" \
+    --format '{{.Names}}' 2>/dev/null | grep -q .
+}
+
+# --------------------------------------------------------- Docker Compose ---
+
+dc() {
+  docker compose --project-directory "$APP_DIR" -f "$APP_DIR/docker-compose.yml" \
+    --env-file "$(env_file)" "$@"
+}
+
+valid_service() {
+  case " $MYAI_SERVICES " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
+}
+
+# svc_state SERVICE: one word.
+#   healthy | starting | unhealthy   (the service has a health check)
+#   running                          (it has none)
+#   failing                          (it keeps crashing and being restarted)
+#   exited | created | paused | dead | restarting | missing
+svc_state() {
+  local id out status health restarts
+  id=$(dc ps -aq "$1" 2>/dev/null | awk 'NR == 1') || id=""
+  if [ -z "$id" ]; then
+    echo missing
+    return 0
+  fi
+  out=$(docker inspect --format \
+    '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}} {{.RestartCount}}' \
+    "$id" 2>/dev/null) || out=""
+  read -r status health restarts <<<"$out" || true
+  case "${status:-missing}" in
+    running)
+      case "${health:-none}" in
+        healthy | unhealthy) echo "$health" ;;
+        starting)
+          if [ "${restarts:-0}" -ge 3 ]; then echo failing; else echo starting; fi
+          ;;
+        *) echo running ;;
+      esac
+      ;;
+    restarting)
+      if [ "${restarts:-0}" -ge 3 ]; then echo failing; else echo restarting; fi
+      ;;
+    *) echo "${status:-missing}" ;;
+  esac
+}
+
+svc_is_up() {
+  case "$(svc_state "$1")" in
+    healthy | starting | unhealthy | running) return 0 ;;
+  esac
+  return 1
+}
+
+# wait_healthy SERVICE SECONDS [what to call it]
+# Returns 0 when healthy, 1 on timeout, 2 when the service stopped or keeps
+# crashing. Prints a line every MYAI_PROGRESS_SECS seconds.
+wait_healthy() {
+  local svc=$1 limit=$2 what=${3:-$1} began=$SECONDS shown=0 elapsed state
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would wait for $what (at most $(fmt_duration "$limit"))"
+    return 0
+  fi
+  while :; do
+    state=$(svc_state "$svc")
+    case "$state" in
+      healthy | running) return 0 ;;
+      exited | dead | failing) return 2 ;;
+    esac
+    elapsed=$((SECONDS - began))
+    if [ "$elapsed" -ge "$limit" ]; then return 1; fi
+    if [ $((elapsed - shown)) -ge "$MYAI_PROGRESS_SECS" ]; then
+      note "waiting for $what ... $(fmt_duration "$elapsed") so far"
+      shown=$elapsed
+    fi
+    sleep "$MYAI_POLL_SECS"
+  done
+}
+
+# "ghcr.io/x/y:tag" -> "ghcr.io/x/y"; Docker Hub prefixes are dropped because
+# Docker leaves them out of the names it reports.
+image_repo() {
+  local ref=$1 last
+  ref=${ref%%@*}
+  last=${ref##*/}
+  case "$last" in
+    *:*) ref=${ref%:*} ;;
+  esac
+  ref=${ref#index.docker.io/}
+  ref=${ref#docker.io/}
+  ref=${ref#library/}
+  printf '%s\n' "$ref"
+}
+
+# image_digest_ref IMAGE: prints "repo@sha256:..." for a pulled image. Fails
+# when Docker knows no digest for it (a locally built image, for example).
+image_digest_ref() {
+  local ref=$1 repo line
+  repo=$(image_repo "$ref")
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    if [ "$(image_repo "$line")" = "$repo" ]; then
+      printf '%s\n' "$line"
+      return 0
+    fi
+  done < <(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$ref" 2>/dev/null)
+  return 1
+}
+
+# -------------------------------------------- the model server's settings ---
+# docker-compose.yml gives the model server (service llm) its settings as
+# LLAMA_* environment variables, plus a few command-line options. A llama.cpp
+# build ignores an environment variable it does not know, without a word, so
+# a setting that a newer build renamed is simply lost. An option it does not
+# know stops it at once instead. Its --help lists every option it knows and,
+# under each, "(env: NAME)" for the variable that sets it.
+
+# compose_llm_settings FILE: the LLAMA_* environment names of service llm,
+# then its command-line options (--name), one per line, in file order.
+compose_llm_settings() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[^[:space:]]/ { top = $0; svc = ""; next }
+    top ~ /^services:/ && /^  [^[:space:]]/ { svc = $1; sub(/:.*$/, "", svc); key = ""; next }
+    svc != "llm" { next }
+    /^    [^[:space:]-]/ { key = $1; sub(/:.*$/, "", key) }
+    key == "environment" && /^      (- )?LLAMA_[A-Z0-9_]+[:=]/ {
+      name = $0
+      sub(/^      (- )?/, "", name)
+      sub(/[:=].*$/, "", name)
+      print name
+    }
+    key == "command" {
+      line = $0
+      while (match(line, /--[a-z][a-z0-9-]*/)) {
+        print substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }' "$1"
+}
+
+# llama_help IMAGE: the --help text of that model server build; nothing when
+# it cannot be run (the image is not on this server, for example) or does not
+# answer within a minute. Nothing is downloaded, the container has no
+# network, and it is removed again.
+llama_help() {
+  local name="myai-llama-help-$$-$RANDOM" out rc=0
+  # When the minute is up, "timeout" tells docker to stop, and docker passes
+  # that on to the container. A program that runs alone in a container does
+  # not get that message unless it is written to; --init puts a small helper
+  # in front of it that hands the message on. If docker still waits 10
+  # seconds later, -k stops docker itself, and the container is removed below.
+  out=$(timeout -k 10 60 docker run --rm --init --pull never --network none --name "$name" "$1" --help 2>&1) || rc=$?
+  if [ "$rc" -ne 0 ]; then docker rm -f "$name" >/dev/null 2>&1 || true; fi
+  # Stopped half-way (124, or 137 by force): part of a help text would make
+  # the settings it leaves out look unknown.
+  case "$rc" in
+    124 | 137) ;;
+    *) printf '%s\n' "$out" ;;
+  esac
+}
+
+# llama_lost_settings IMAGE COMPOSE_FILE: the settings in COMPOSE_FILE that the
+# model server build IMAGE does not know, one per line; nothing when it knows
+# them all. Fails when that cannot be told: no help text with environment
+# names, or no settings found in the file.
+llama_lost_settings() {
+  local settings help envs opts name other
+  settings=$(compose_llm_settings "$2" 2>/dev/null) || settings=""
+  [ -n "$settings" ] || return 1
+  help=$(llama_help "$1")
+  envs=$(printf '%s\n' "$help" | grep -F '(env:' | grep -oE 'LLAMA_[A-Z0-9_]+' | sort -u) || envs=""
+  [ -n "$envs" ] || return 1
+  # Option names, from the lines that introduce an option. A help text in
+  # which no line does so cannot tell which options the build knows.
+  opts=$(printf '%s\n' "$help" | grep -E '^-' | grep -oE -- '--[a-z0-9][a-z0-9-]*' | sort -u) || opts=""
+  for name in $settings; do
+    case "$name" in
+      --*)
+        if [ -n "$opts" ] && ! grep -qxF -- "$name" <<<"$opts"; then printf '%s\n' "$name"; fi
+        continue
+        ;;
+    esac
+    if grep -qxF -- "$name" <<<"$envs"; then continue; fi
+    # The old and the new name of one switch, both in the file (repacking):
+    # a build that lists either one knows the switch. Newer builds still read
+    # the old name without listing it. A lost switch is named once, by its
+    # new name.
+    case "$name" in
+      LLAMA_ARG_NO_*) other=LLAMA_ARG_${name#LLAMA_ARG_NO_} ;;
+      LLAMA_ARG_*) other=LLAMA_ARG_NO_${name#LLAMA_ARG_} ;;
+      *) other="" ;;
+    esac
+    if [ -n "$other" ] && grep -qxF -- "$other" <<<"$settings"; then
+      if grep -qxF -- "$other" <<<"$envs"; then continue; fi
+      case "$name" in
+        LLAMA_ARG_NO_*) continue ;;
+      esac
+    fi
+    printf '%s\n' "$name"
+  done
+}
+
+# llama_setting_meaning NAME: "serious|text" or "minor|text": what a lost
+# setting means for the owner. Serious ones can stop the model server, fill
+# the memory or let others use it.
+llama_setting_meaning() {
+  case "$1" in
+    LLAMA_ARG_MODEL) echo "serious|which model file to load. Without it the model server cannot start." ;;
+    LLAMA_ARG_ALIAS) echo "minor|the name the model is offered under (\"assistant\"). Without it the model is listed under its file name instead." ;;
+    LLAMA_ARG_HOST) echo "serious|that the model server listens on the network inside Docker. Without it the agent cannot reach the model." ;;
+    LLAMA_ARG_PORT) echo "serious|the port where the agent and the health check find the model server (8080). Without it nothing reaches the model." ;;
+    LLAMA_API_KEY) echo "serious|the password between the agent and the model server. Without it the model server answers any program on its network." ;;
+    LLAMA_ARG_CTX_SIZE) echo "serious|how much text the model keeps in mind (LLM_CTX). Without it the model server takes the model's own maximum, which can need many GB more memory." ;;
+    LLAMA_ARG_REPACK | LLAMA_ARG_NO_REPACK) echo "serious|the switch that keeps a single copy of the model in memory. Without it the model needs about twice its size in memory: the default model no longer fits in 32 GB, and the system stops the model server when the memory runs out." ;;
+    LLAMA_ARG_CACHE_RAM) echo "serious|the memory limit for remembered conversations (LLM_CACHE_RAM_MIB). Without it they can take up to 8 GB of memory instead." ;;
+    LLAMA_ARG_LOAD_MODE) echo "minor|how the model is held in memory (LLM_LOAD_MODE). Without it the system can move parts of the model out of memory, and answers get slower." ;;
+    LLAMA_ARG_N_PARALLEL) echo "minor|how many requests the model works on at the same time (LLM_PARALLEL)." ;;
+    LLAMA_ARG_THREADS) echo "minor|how many CPU threads write answers (LLM_THREADS). Without it the model server picks its own number, which can use up Hostinger's CPU credits faster." ;;
+    LLAMA_ARG_CTX_CHECKPOINTS) echo "minor|how many snapshots of a conversation are kept (8). Without it more are kept, which takes more memory." ;;
+    LLAMA_ARG_UI) echo "minor|that the model server's own chat page is off. Nothing outside Docker can reach that page, so this one does no harm." ;;
+    LLAMA_ARG_REASONING) echo "minor|that each request can turn thinking on or off. Without it the model may think when it should not, or the other way round." ;;
+    LLAMA_ARG_THINK_BUDGET) echo "minor|the limit on thinking (LLM_THINK_BUDGET). Without it the model can think for a very long time before it answers." ;;
+    LLAMA_ARG_N_PREDICT) echo "minor|the longest answer when a program sets no limit. Without it an answer can go on for a very long time." ;;
+    LLAMA_ARG_TEMPERATURE | LLAMA_ARG_TOP_P | LLAMA_ARG_TOP_K | LLAMA_ARG_MIN_P | LLAMA_ARG_PRESENCE_PENALTY)
+      echo "minor|how the model picks its words (LLM_${1#LLAMA_ARG_}). Without it the model server uses its own default, and answers can wander or repeat themselves."
+      ;;
+    LLAMA_ARG_TIMEOUT) echo "minor|how long one request may take (an hour). Without it long answers can be cut off." ;;
+    --threads-batch) echo "serious|how many CPU threads read prompts (LLM_THREADS_BATCH)." ;;
+    --*) echo "serious|an option of the model server." ;;
+    *) echo "minor|a setting from docker-compose.yml. The model server uses its own default instead." ;;
+  esac
+}
+
+# ---------------------------------------------- the model server's memory ---
+
+# llm_facts: what Docker knows about the model server's container, in
+# LLM_PID (0 when it does not run), LLM_OOM ("true" when the kernel stopped
+# it the last time for lack of memory; Docker forgets that once it runs
+# again), LLM_RESTARTS and LLM_SINCE (when the container was made, in seconds
+# since 1970). Fails when there is no container.
+llm_facts() {
+  local id out created=""
+  LLM_PID=0
+  LLM_OOM=false
+  LLM_RESTARTS=0
+  LLM_SINCE=""
+  id=$(dc ps -aq llm 2>/dev/null | awk 'NR == 1') || id=""
+  [ -n "$id" ] || return 1
+  out=$(docker inspect --format '{{.State.Pid}} {{.State.OOMKilled}} {{.RestartCount}} {{.Created}}' \
+    "$id" 2>/dev/null) || return 1
+  read -r LLM_PID LLM_OOM LLM_RESTARTS created <<<"$out" || true
+  [[ $LLM_PID =~ ^[0-9]+$ ]] || LLM_PID=0
+  [[ $LLM_RESTARTS =~ ^[0-9]+$ ]] || LLM_RESTARTS=0
+  if [ -n "$created" ]; then LLM_SINCE=$(date -d "$created" +%s 2>/dev/null) || LLM_SINCE=""; fi
+}
+
+# llm_oom_kills: how often the kernel stopped the model server because the
+# memory ran out, since its container was made. The kernel log names the
+# program it stopped ("Killed process 1234 (llama-server)"); the container's
+# own memory counters are gone once it has stopped. The log of every boot
+# since then counts (not --dmesg, which reads only this boot): when the chat
+# stops answering, a restart of the server is a likely next step, and the
+# container survives it. Needs llm_facts.
+llm_oom_kills() {
+  local kills=0
+  if [ -n "$LLM_SINCE" ] && command -v journalctl >/dev/null 2>&1; then
+    kills=$(journalctl -q --no-pager -o cat _TRANSPORT=kernel --since "@$LLM_SINCE" 2>/dev/null |
+      grep -oE 'Killed process [0-9]+ \(llama-server\)' | sort -u | wc -l) || kills=0
+  fi
+  [[ $kills =~ ^[0-9]+$ ]] || kills=0
+  if [ "$kills" -eq 0 ] && [ "$LLM_OOM" = true ]; then kills=1; fi
+  printf '%s\n' "$kills"
+}
+
+# llm_memory_kb: "OWN FILE SWAP": the model server's memory in kB, from
+# /proc. OWN is memory of its own, in RAM or moved to swap; FILE is files it
+# maps, the model above all; SWAP is the part of OWN in swap. The default
+# load mode locks the model file in RAM, so when a second copy does not fit
+# beside it, the system moves part of that copy to swap. Fails when it cannot
+# be read. Needs llm_facts.
+llm_memory_kb() {
+  [ "$LLM_PID" -gt 0 ] || return 1
+  awk '$1 == "RssAnon:" { a = $2 } $1 == "RssFile:" { f = $2 } $1 == "VmSwap:" { s = $2 }
+    END { if (a == "" || f == "") exit 1; print a + s, f, s + 0 }' "$MYAI_SYSROOT/proc/$LLM_PID/status" 2>/dev/null
+}
+
+# model_held_twice OWN_KB FILE_KB MODEL_BYTES CTX CACHE_MIB: true when the
+# model server's memory can only be explained by a second copy of the model,
+# which llama.cpp makes when weight repacking is on. Besides one copy of the
+# model it may use: the prompt cache (CACHE_MIB), 150 KB per token of context
+# (the "classic" model needs 98 KB, the others less), and 512 MB plus 30% of
+# the model for working buffers and the snapshots of long conversations.
+# Measured with repacking on, the copy was 80% of a 4.2 GB mixture-of-experts
+# file (72% in the CPU_REPACK buffers that CPUs without AMX use) and the whole
+# of a 2.5 GB dense one.
+model_held_twice() {
+  awk -v a="$1" -v f="$2" -v m="$3" -v ctx="$4" -v cache="$5" 'BEGIN {
+    extra = (a + f) * 1024 - m
+    allowed = cache * 1048576 + ctx * 150000 + 512 * 1048576 + 0.3 * m
+    exit !(extra > allowed)
+  }'
+}
+
+# ------------------------------------------------- talking to the gateway ---
+# The agent service is the only way to the model, and it publishes no port.
+# These probes therefore run inside the agent container (it has Python and
+# already holds AGENT_API_KEY, so no secret appears on a command line).
+
+GATEWAY_CHAT_PY='
+import json, os, sys, time, urllib.error, urllib.request
+prompt, max_tokens, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+body = {"model": "assistant", "stream": False, "max_tokens": max_tokens, "temperature": 0,
+        "messages": [{"role": "user", "content": prompt}]}
+req = urllib.request.Request(
+    "http://127.0.0.1:8090/v1/chat/completions", data=json.dumps(body).encode(),
+    headers={"Content-Type": "application/json",
+             "Authorization": "Bearer " + os.environ.get("AGENT_API_KEY", "")})
+began = time.time()
+try:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.load(resp)
+except urllib.error.HTTPError as exc:
+    detail = exc.read(300).decode("utf-8", "replace").replace("\n", " ")
+    print("error HTTP %s %s" % (exc.code, detail))
+    sys.exit(1)
+except Exception as exc:
+    print("error " + str(exc).replace("\n", " ")[:300])
+    sys.exit(1)
+took = time.time() - began
+timings = data.get("timings") or {}
+usage = data.get("usage") or {}
+tokens = timings.get("predicted_n") or usage.get("completion_tokens") or 0
+speed = timings.get("predicted_per_second") or (tokens / took if took > 0 else 0)
+if not tokens:
+    print("error the model returned no text")
+    sys.exit(1)
+print("ok %.2f %.2f %d %.1f" % (speed, timings.get("prompt_per_second") or 0, tokens, took))
+'
+
+# gateway_chat PROMPT MAX_TOKENS [TIMEOUT_SECONDS]
+# Prints "ok <tokens/s generating> <tokens/s reading> <tokens> <seconds>" or
+# "error <reason>".
+gateway_chat() {
+  dc exec -T agent python -c "$GATEWAY_CHAT_PY" "$1" "$2" "${3:-900}" 2>&1
+}
+
+AGENT_TASK_PY='
+import json, os, sys, time, urllib.error, urllib.request
+prompt, limit = sys.argv[1], float(sys.argv[2])
+base = "http://127.0.0.1:8090/agent/api"
+head = {"Content-Type": "application/json",
+        "Authorization": "Bearer " + os.environ.get("AGENT_API_KEY", "")}
+def call(method, path, body=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(base + path, data=data, headers=head, method=method)
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        return json.load(resp)
+began = time.time()
+try:
+    task_id = call("POST", "/tasks", {"prompt": prompt})["id"]
+    while True:
+        task = call("GET", "/tasks/%s" % task_id)
+        if task.get("status") in ("done", "error", "cancelled"):
+            break
+        if time.time() - began > limit:
+            print("error the task did not finish in %d seconds" % limit)
+            sys.exit(1)
+        time.sleep(3)
+except urllib.error.HTTPError as exc:
+    print("error HTTP %s %s" % (exc.code, exc.read(300).decode("utf-8", "replace").replace("\n", " ")))
+    sys.exit(1)
+except Exception as exc:
+    print("error " + str(exc).replace("\n", " ")[:300])
+    sys.exit(1)
+if task.get("status") != "done":
+    print("error the task ended as %s: %s" % (task.get("status"), str(task.get("error") or "")[:200]))
+    sys.exit(1)
+# The task log: {"t": "tool", "name": ..., "ok": true|false, ...} for each tool call.
+used = [str(s.get("name") or "?") for s in task.get("steps") or []
+        if isinstance(s, dict) and s.get("t") == "tool" and s.get("ok")]
+print("ok %d %.1f %s" % (len(used), time.time() - began, ",".join(used) or "-"))
+'
+
+# agent_task PROMPT [TIMEOUT_SECONDS]: runs one agent task to the end.
+# Prints "ok <tool calls that worked> <seconds> <their tool names, or ->"
+# or "error <reason>".
+agent_task() {
+  dc exec -T agent python -c "$AGENT_TASK_PY" "$1" "${2:-900}" 2>&1
+}
+
+# ---------------------------------------------------------- model download ---
+
+# What to do when a model cannot be used. The installer sets its own advice:
+# during the first installation the myai command does not exist yet.
+: "${MODEL_CHOICE_HINT:=Choose another model: myai model list   and then: myai model use <id>}"
+
+file_size() { stat -c %s -- "$1" 2>/dev/null; }
+
+# A GGUF model file starts with the four bytes "GGUF".
+file_is_gguf() {
+  [ -f "$1" ] && [ "$(head -c 4 -- "$1" | od -An -tx1 | tr -d ' \n')" = 47475546 ]
+}
+
+# model_file_complete PATH [BYTES]: the file exists, is a GGUF file and, when
+# BYTES is known, has that size.
+model_file_complete() {
+  local path=$1 want=${2:-}
+  file_is_gguf "$path" || return 1
+  if [ -n "$want" ] && [ "$(file_size "$path")" != "$want" ]; then return 1; fi
+  return 0
+}
+
+# hf_file_info REPO FILE: prints "<bytes> <sha256>" as Hugging Face reports
+# them ("-" for a part it does not report). Fails when the answer cannot be
+# fetched or does not list the file.
+hf_file_info() {
+  local repo=$1 file=$2 dir url json out
+  dir=$(dirname "$file")
+  url="$MYAI_HF_BASE/api/models/$repo/tree/main"
+  if [ "$dir" != "." ]; then url="$url/$dir"; fi
+  json=$(curl -fsSL --connect-timeout 15 --max-time 60 "$url" 2>/dev/null) || return 1
+  out=$(printf '%s' "$json" | jq -r --arg f "$file" '
+    if type == "array" then .[] else empty end
+    | select(type == "object" and .path == $f)
+    | "\(.size // "-") \(.lfs.oid // "-")"' 2>/dev/null | awk 'NR == 1') || return 1
+  [ -n "$out" ] || return 1
+  printf '%s\n' "$out"
+}
+
+download_progress() { # PART WANT
+  local have
+  have=$(file_size "$1") || have=0
+  if [ -n "$2" ] && [ "$2" -gt 0 ]; then
+    note "downloaded $(fmt_gb "$have") of $(fmt_gb "$2") ($((have * 100 / $2))%)"
+  else
+    note "downloaded $(fmt_gb "$have") so far"
+  fi
+}
+
+# fetch_resumable URL PART WANT: one curl run that continues PART where it
+# stopped. Returns curl's exit code and leaves the HTTP status in
+# FETCH_HTTP_CODE and curl's error text in FETCH_ERROR. curl's own progress meter is replaced by plain lines,
+# which also read well in a log file.
+fetch_resumable() {
+  local url=$1 part=$2 want=$3 codefile errfile ticker rc=0
+  codefile=$(mktemp)
+  errfile=$(mktemp)
+  (
+    while sleep "$MYAI_PROGRESS_SECS" >/dev/null 2>&1; do
+      kill -0 "$$" 2>/dev/null || exit 0
+      download_progress "$part" "$want"
+    done
+  ) &
+  ticker=$!
+  # Give up on a connection that moves less than 1 kB/s for two minutes; the
+  # caller then tries again and continues from the same place.
+  curl -fL -sS -C - --connect-timeout 30 --speed-limit 1024 --speed-time 120 \
+    -o "$part" -w '%{http_code}' "$url" >"$codefile" 2>"$errfile" || rc=$?
+  kill "$ticker" 2>/dev/null || true
+  wait "$ticker" 2>/dev/null || true
+  FETCH_HTTP_CODE=$(cat "$codefile" 2>/dev/null) || FETCH_HTTP_CODE=""
+  # curl's own words for what went wrong, for the message to the user.
+  FETCH_ERROR=$(awk 'NF { line = $0 } END { sub(/^curl: \([0-9]+\) /, "", line); print line }' "$errfile" 2>/dev/null) || FETCH_ERROR=""
+  rm -f "$codefile" "$errfile"
+  return "$rc"
+}
+
+# download_verified URL DEST BYTES SHA256
+# BYTES and SHA256 may be empty when unknown. Downloads to DEST.part,
+# continues an earlier partial download, checks size, file type and (when a
+# checksum is known) SHA-256, and only then gives the file its final name.
+# A failed check is fatal and removes the bad file.
+download_verified() {
+  local url=$1 dest=$2 want=$3 sha=$4 part="$2.part" have before tries=0 rc got name
+  name=$(basename "$dest")
+
+  if [ -e "$dest" ]; then
+    if model_file_complete "$dest" "$want"; then
+      note "Already downloaded: $name"
+      return 0
+    fi
+    # Not something this code wrote (it renames only complete files), so it
+    # cannot be continued safely.
+    warn "$name exists but is incomplete or not a model file. Downloading it again."
+    rm -f -- "$dest"
+  fi
+
+  if [ -f "$part" ] && [ -n "$want" ]; then
+    have=$(file_size "$part") || have=0
+    if [ "$have" -gt "$want" ]; then rm -f -- "$part"; fi
+  fi
+  if [ -f "$part" ]; then
+    note "Continuing an earlier download ($(fmt_gb "$(file_size "$part")") already here)."
+  fi
+
+  while :; do
+    before=$(file_size "$part") || before=0
+    if [ -n "$want" ] && [ "$before" = "$want" ]; then break; fi
+    rc=0
+    fetch_resumable "$url" "$part" "$want" || rc=$?
+    if [ "$rc" -eq 0 ]; then break; fi
+    case "$FETCH_HTTP_CODE" in
+      416) break ;; # nothing left to fetch: the partial file is already whole
+      401 | 403 | 404)
+        die "The model file could not be downloaded (the server answered $FETCH_HTTP_CODE)." \
+          "Address: $url" \
+          "The file may have been renamed or removed by its publisher." \
+          "$MODEL_CHOICE_HINT"
+        ;;
+    esac
+    have=$(file_size "$part") || have=0
+    if [ "$have" -gt "$before" ]; then tries=0; fi # it moved forward: keep going
+    tries=$((tries + 1))
+    if [ "$tries" -ge "$MYAI_DOWNLOAD_TRIES" ]; then
+      die "The download failed $tries times in a row (${FETCH_ERROR:-curl error $rc})." \
+        "What is here so far is kept. Run the same command again to continue." \
+        "If it keeps failing, check the internet connection: curl -I https://huggingface.co"
+    fi
+    note "The download stopped (${FETCH_ERROR:-curl error $rc}). Trying again in $MYAI_RETRY_SECS seconds; it continues where it stopped."
+    sleep "$MYAI_RETRY_SECS"
+  done
+
+  have=$(file_size "$part") || have=0
+  if [ -n "$want" ] && [ "$have" != "$want" ]; then
+    rm -f -- "$part"
+    die "The downloaded file has the wrong size ($have bytes, expected $want)." \
+      "It was removed. Something between this server and Hugging Face may have cut it short." \
+      "Run the same command again. If the size is wrong again: $MODEL_CHOICE_HINT"
+  fi
+  if ! file_is_gguf "$part"; then
+    rm -f -- "$part"
+    die "The downloaded file is not a model file (it does not start with GGUF)." \
+      "It was removed. Something between this server and Hugging Face returned a different page." \
+      "Run the same command again in a few minutes."
+  fi
+  if [ -n "$sha" ]; then
+    note "Checking the file against its SHA-256 checksum. This takes a minute or two."
+    got=$(sha256sum -- "$part" | awk '{ print $1 }')
+    if [ "$got" != "$sha" ]; then
+      rm -f -- "$part"
+      die "The downloaded file is damaged: its checksum does not match the one Hugging Face reports." \
+        "It was removed. Run the same command again to download it afresh."
+    fi
+    note "Checksum correct."
+  else
+    warn "Hugging Face did not report a checksum for this file, so that check was skipped. Size and file type are correct."
+  fi
+  chmod 644 "$part"
+  mv -f -- "$part" "$dest"
+}
+
+# download_model HF_REPO FILE BYTES MODELS_DIR
+# BYTES may be empty (a model that is not in the catalogue); the size
+# Hugging Face reports is used then.
+download_model() {
+  local repo=$1 file=$2 want=$3 dir=$4 dest info size="" sha="" url
+  dest="$dir/$(basename "$file")"
+  url="$MYAI_HF_BASE/$repo/resolve/main/$file?download=true"
+
+  if model_file_complete "$dest" "$want"; then
+    note "The model file is already here: $dest"
+    return 0
+  fi
+  if [ "$DRY_RUN" = 1 ]; then
+    note "would download $url"
+    note "  to $dest${want:+ ($(fmt_gb "$want"))}, continuing a partial download if there is one,"
+    note "  then check its size, that it is a GGUF file, and its SHA-256 checksum"
+    return 0
+  fi
+
+  if info=$(hf_file_info "$repo" "$file"); then
+    read -r size sha <<<"$info" || true
+    [[ $size =~ ^[0-9]+$ ]] || size=""
+    [[ $sha =~ ^[0-9a-f]{64}$ ]] || sha=""
+  fi
+  # Another size than the catalogue's means the publisher has uploaded a new
+  # file under the same name. It would be downloaded in full and then fail
+  # the size check, on every try, so stop before the download. A partial
+  # file of the old upload can never be completed either.
+  if [ -n "$want" ] && [ -n "$size" ] && [ "$size" != "$want" ]; then
+    if [ -f "$dest.part" ]; then
+      rm -f -- "$dest.part"
+      note "Removed the partial download of the old file ($dest.part)."
+    fi
+    die "The publisher has replaced the model file $(basename "$file"): Hugging Face lists it with $size bytes, the model list of myai with $want." \
+      "The new file cannot be checked, so nothing was downloaded." \
+      "$MODEL_CHOICE_HINT"
+  fi
+  if [ -z "$want" ]; then want=$size; fi
+
+  mkdir -p "$dir"
+  note "Downloading $(basename "$file")${want:+ ($(fmt_gb "$want"))} from Hugging Face."
+  note "A progress line appears every $MYAI_PROGRESS_SECS seconds. If this stops, run the same command again: it continues."
+  download_verified "$url" "$dest" "$want" "$sha"
+  note "Model file ready: $dest"
+}
+
+# ------------------------------------------------------------ certificate ---
+# CADDY_TLS_LINE (see the Caddyfile) has three forms:
+#   ""              a certificate from Let's Encrypt
+#   "tls internal"  a self-signed certificate (localhost, a bare IP address)
+#   "tls <e-mail>"  Let's Encrypt, and ZeroSSL when that fails; both services
+#                   need a contact address for it. A public certificate too.
+
+tls_is_self_signed() { [[ ${1:-} =~ ^[[:space:]]*tls[[:space:]]+internal[[:space:]]*$ ]]; }
+
+# Prints the contact address of a "tls <e-mail>" line; fails for the others.
+tls_contact() {
+  [[ ${1:-} =~ ^[[:space:]]*tls[[:space:]]+([^[:space:]]+@[^[:space:]]+)[[:space:]]*$ ]] || return 1
+  printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+# True for an address that can be the contact for the certificate: a real
+# one. Let's Encrypt refuses example and reserved domains, and with a refused
+# address it issues no certificate at all.
+usable_contact_email() {
+  local domain
+  valid_email "${1:-}" || return 1
+  domain=${1##*@}
+  domain=${domain,,}
+  case "$domain" in
+    example.* | *.example.* | *.example | *.test | *.invalid | *.localhost | *.local | *.localdomain | \
+      *.internal | *.lan | *.home | *.arpa)
+      return 1
+      ;;
+  esac
+  return 0
+}
+
+# ------------------------------------------------------ links and secrets ---
+
+entry_link() {
+  printf 'https://%s/enter/%s\n' "$(env_get SITE_ADDRESS)" "$(env_get GATE_TOKEN)"
+}
+
+# A QR code in the terminal, when the qrencode tool is installed.
+print_qr() {
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -t ANSIUTF8 -m 2 -- "$1" 2>/dev/null || true
+  fi
+}
+
+# The text of the credentials sheet, built from the settings file.
+credentials_text() {
+  local site tls email password dash code
+  site=$(env_get SITE_ADDRESS) || site="?"
+  tls=$(env_get CADDY_TLS_LINE) || tls=""
+  email=$(env_get WEBUI_ADMIN_EMAIL) || email="?"
+  password=$(env_get WEBUI_ADMIN_PASSWORD) || password="?"
+  dash=$(env_get DASHBOARD_PASSWORD) || dash=""
+  code=$(env_get PAIRING_CODE) || code=""
+  cat <<EOF
+1. Open this link once on each phone or computer you want to use.
+   It is your key to the server, so keep it to yourself:
+
+     $(entry_link)
+
+2. Log in to the chat with:
+
+     E-mail:    $email
+     Password:  $password
+
+   (These are the first login details. If you change them in the chat page,
+   the new ones count there.)
+
+3. The agent dashboard (tasks, schedules, notes):
+
+     https://$site/agent/
+     Password:  ${dash:-(password login is switched off)}
+
+4. Telegram (optional):
+     a. In Telegram, write to @BotFather, send /newbot and copy the token it gives you.
+     b. On this server run:   myai telegram set
+     c. Send your new bot this message:   /pair $code
+EOF
+  # Only then: teaching anyone to click past a certificate warning on a site
+  # with a public certificate would be dangerous.
+  if tls_is_self_signed "$tls"; then
+    cat <<EOF
+
+Note: this server uses a self-signed certificate. Your browser will show a
+warning the first time; choose "Advanced" and continue.
+EOF
+  fi
+}
+
+# ------------------------------------------------------------------- lock ---
+
+# One command that changes things at a time: the installer, an update, a
+# backup, a benchmark, the 5-minute repair. The lock is released when the
+# process (and anything it starts) ends. The lock file names its holder, so
+# that a second command can say what it is waiting for.
+
+# Seconds a command waits for another one to finish.
+: "${MYAI_LOCK_WAIT:=900}"
+
+# Reads the holder from the lock file into LOCK_PID, LOCK_SINCE and
+# LOCK_WHAT (LOCK_WHAT is empty when the file names nobody).
+read_lock_holder() {
+  local line
+  LOCK_PID=""
+  LOCK_SINCE=""
+  LOCK_WHAT=""
+  line=$(head -n 1 -- "$APP_DIR/.lock" 2>/dev/null) || line=""
+  read -r LOCK_PID LOCK_SINCE LOCK_WHAT <<<"$line" || true
+  [[ $LOCK_PID =~ ^[0-9]+$ ]] || LOCK_WHAT=""
+}
+
+# "myai backup (process 4242, since 03:15)", or "another myai command".
+lock_holder() {
+  read_lock_holder
+  if [ -n "$LOCK_WHAT" ]; then
+    printf '%s (process %s, since %s)\n' "$LOCK_WHAT" "$LOCK_PID" "$LOCK_SINCE"
+  else
+    printf 'another myai command\n'
+  fi
+}
+
+# True while another process holds the lock.
+lock_is_held() {
+  [ -f "$APP_DIR/.lock" ] && ! flock -n "$APP_DIR/.lock" true 2>/dev/null
+}
+
+# Stops with advice when the holder is the installer: it can take an hour,
+# which is too long to wait for.
+refuse_while_installing() {
+  read_lock_holder
+  if [ "$LOCK_WHAT" = "the installer" ]; then
+    die "The installer is still running (process $LOCK_PID, since $LOCK_SINCE)." \
+      "Wait until it has finished, then try again." \
+      "If the Hostinger post-install script started it, watch it with: tail -f /root/myai-install.log"
+  fi
+}
+
+# acquire_lock [wait|try]
+#   wait (the default): wait up to MYAI_LOCK_WAIT seconds for the holder,
+#                       but stop at once when it is the installer
+#   try:                give up at once (the 5-minute repair)
+# MYAI_LOCK_NAME says what this command is, for the others to see.
+acquire_lock() {
+  local mode=${1:-wait} holder
+  # ">>": opening the file must not empty it while it names another holder.
+  exec 9>>"$APP_DIR/.lock"
+  if ! flock -n 9; then
+    if [ "$mode" = try ]; then return 1; fi
+    refuse_while_installing
+    holder=$(lock_holder)
+    note "Waiting for $holder to finish (at most $((MYAI_LOCK_WAIT / 60)) minutes) ..."
+    flock -w "$MYAI_LOCK_WAIT" 9 ||
+      die "Gave up waiting: $holder is still working." "Try again when it has finished."
+  fi
+  printf '%s %s %s\n' "$$" "$(date +%H:%M)" "${MYAI_LOCK_NAME:-a myai command}" >"$APP_DIR/.lock" 2>/dev/null || true
+}

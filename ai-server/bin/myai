@@ -1,0 +1,1258 @@
+#!/usr/bin/env bash
+# myai: everyday commands for the myai server. Run "myai help" for the list.
+#
+# It works on the files in the directory it is installed in (the installer
+# links /usr/local/bin/myai to this file) and needs nothing from the internet
+# except for "update" and for downloading a model.
+
+set -euo pipefail
+
+MYAI_SELF=$(readlink -f "${BASH_SOURCE[0]}")
+APP_DIR=${MYAI_DIR:-$(dirname "$(dirname "$MYAI_SELF")")}
+ENV_FILE="$APP_DIR/.env"
+# Test hook: a directory that stands in for "/" (see myai-lib.sh).
+: "${MYAI_SYSROOT:=}"
+
+# shellcheck source-path=SCRIPTDIR
+# shellcheck source=myai-lib.sh
+. "$(dirname "$MYAI_SELF")/myai-lib.sh"
+
+BACKUP_KEEP=7
+BACKUP_STOPPED=()
+BACKUP_TMP=""
+BACKUP_FILE=""
+BENCH_RESTORE=""
+RESTORE_RESTART=0
+RESTORE_DATA=""
+RESTORE_STAGE=""
+RESTORE_MOVED=()
+RESTORE_ENV_SAVED=0
+RESTORE_DONE=0
+DOC_BAD=0
+DOC_LOOK=0
+
+# Runs when myai ends, however it ends. Each part does something only when
+# its command left work for it: one handler, so that a backup made during a
+# restore cannot replace the restore's own clean-up.
+myai_cleanup() {
+  backup_cleanup
+  restore_cleanup
+  bench_cleanup
+}
+
+cmd_help() {
+  cat <<'EOF'
+myai: commands for your private AI server
+
+  myai status               what is running
+  myai doctor               check everything and get advice
+  myai link                 your entry link, also as a QR code
+  myai creds                the link, the logins and the passwords
+  myai logs [service]       recent messages
+                            (services: llm agent sandbox webui searxng caddy)
+
+  myai start                start everything
+  myai stop                 stop everything; it stays stopped until "myai start"
+  myai restart [service]    restart everything, or one service
+  myai update               get the newest version (settings and data are kept)
+
+  myai model list           the models you can choose from
+  myai model use <id>       switch to another model (downloads it if needed)
+  myai model custom <huggingface repository> <file>
+                            use any GGUF model file from Hugging Face
+  myai think <on|off|auto>  whether the agent "thinks" before it answers
+  myai bench                measure and set the best number of CPU threads
+
+  myai telegram             how to connect a Telegram bot, and your pairing code
+  myai telegram set         store the bot token (you are asked for it)
+
+  myai backup               save settings and data now
+  myai restore <file>       go back to a backup
+  myai uninstall [--purge]  remove myai (--purge also deletes data and models)
+
+Add --yes to any command to answer its questions with yes.
+EOF
+}
+
+# ----------------------------------------------------------------- helpers ---
+
+data_dir() {
+  local d
+  d=$(env_get DATA_DIR) || d=""
+  printf '%s\n' "${d:-$APP_DIR/data}"
+}
+
+model_path() {
+  local file
+  file=$(env_get MODEL_FILE) || file=""
+  printf '%s/models/%s\n' "$(data_dir)" "$file"
+}
+
+# "myai stop" leaves this file behind, so that the 5-minute repair timer does
+# not start again what the owner stopped on purpose.
+stack_is_stopped() { [ -e "$APP_DIR/.stopped" ]; }
+
+state_words() {
+  case "$1" in
+    healthy) echo "ready" ;;
+    running) echo "running" ;;
+    starting) echo "starting, not ready yet" ;;
+    unhealthy) echo "NOT WORKING (it does not answer)" ;;
+    failing) echo "NOT WORKING (it keeps crashing)" ;;
+    exited | dead | created) echo "stopped" ;;
+    missing) echo "not created" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+# Recreate one service so that it picks up a changed setting.
+apply_to() { # SERVICE
+  if stack_is_stopped || [ "$(svc_state "$1")" = missing ]; then
+    note "This takes effect when the services are started: myai start"
+    return 0
+  fi
+  dc up -d --no-deps "$1"
+}
+
+wait_ready() {
+  local rc=0
+  say "Waiting for the model to load. This takes a few minutes."
+  say "(Ctrl+C stops the waiting, not the server.)"
+  wait_healthy llm 1800 "the model" || rc=$?
+  case "$rc" in
+    0) say "Ready." ;;
+    1) warn "The model is still loading after 30 minutes. Look at: myai logs llm" ;;
+    *)
+      die "The model server stopped or keeps crashing." \
+        "Its messages: myai logs llm" \
+        "Usual cause: too little free memory. A smaller model: myai model use fast"
+      ;;
+  esac
+}
+
+# ------------------------------------------------------- status and logs ---
+
+cmd_status() {
+  local svc state bad=0 site id file thinking threads
+  site=$(env_get SITE_ADDRESS) || site="?"
+  id=$(env_get MODEL_ID) || id="?"
+  file=$(env_get MODEL_FILE) || file="?"
+  thinking=$(env_get AGENT_THINKING) || thinking="auto"
+  threads=$(env_get LLM_THREADS) || threads="?"
+  say "Address:   https://$site   (your entry link: myai link)"
+  say "Model:     $id ($file)"
+  say "Settings:  $threads threads, agent thinking: $thinking"
+  say ""
+  for svc in $MYAI_SERVICES; do
+    state=$(svc_state "$svc")
+    printf '  %-8s  %s\n' "$svc" "$(state_words "$state")"
+    case "$state" in
+      healthy | running) ;;
+      *) bad=$((bad + 1)) ;;
+    esac
+  done
+  say ""
+  if stack_is_stopped; then
+    say "myai was stopped with \"myai stop\". Start it again with: myai start"
+  elif [ "$bad" -eq 0 ]; then
+    say "Everything is running."
+  else
+    say "$bad service(s) are not ready."
+    say "If the server was started in the last few minutes, wait and look again."
+    say "Otherwise run: myai doctor"
+  fi
+}
+
+cmd_logs() {
+  local svc=${1:-}
+  if [ -n "$svc" ] && ! valid_service "$svc"; then
+    die "There is no service called '$svc'." "The services are: $MYAI_SERVICES"
+  fi
+  if [ -t 1 ]; then
+    say "(Showing new messages as they come. Press Ctrl+C to stop.)"
+    dc logs --tail 100 -f ${svc:+"$svc"}
+  else
+    dc logs --tail 200 ${svc:+"$svc"}
+  fi
+}
+
+# ------------------------------------------------------ start, stop, update ---
+
+cmd_start() {
+  local file
+  file=$(model_path)
+  if ! file_is_gguf "$file"; then
+    die "The model file is missing: $file" \
+      "Download a model with: myai model use <id>   (the list: myai model list)"
+  fi
+  acquire_lock
+  rm -f "$APP_DIR/.stopped"
+  dc up -d --remove-orphans
+  wait_ready
+}
+
+cmd_stop() {
+  acquire_lock
+  : >"$APP_DIR/.stopped"
+  dc stop
+  say "Stopped. It stays stopped, also after a reboot, until you run: myai start"
+}
+
+cmd_restart() {
+  local svc=${1:-}
+  if [ -n "$svc" ] && ! valid_service "$svc"; then
+    die "There is no service called '$svc'." "The services are: $MYAI_SERVICES"
+  fi
+  acquire_lock
+  rm -f "$APP_DIR/.stopped"
+  if [ -n "$svc" ]; then
+    dc up -d --force-recreate --no-deps "$svc"
+  else
+    dc up -d --force-recreate --remove-orphans
+  fi
+  if [ -z "$svc" ] || [ "$svc" = llm ]; then
+    wait_ready
+  else
+    say "Restarted: $svc"
+  fi
+}
+
+# The installer that is already on this machine does the update: it fetches
+# the newest app files and hands over to the installer inside them.
+cmd_update() {
+  [ -f "$APP_DIR/install.sh" ] ||
+    die "The installer is missing from $APP_DIR." "Run the install command from the README again; it keeps your data."
+  acquire_lock
+  exec bash "$APP_DIR/install.sh" --update --yes --dir "$APP_DIR"
+}
+
+# ------------------------------------------------------- link, credentials ---
+
+cmd_link() {
+  local link
+  link=$(entry_link)
+  say "Your entry link. Open it once on each device. Keep it to yourself:"
+  say ""
+  say "  $link"
+  say ""
+  print_qr "$link"
+}
+
+cmd_creds() {
+  credentials_text
+  say ""
+  say "These values are read from $ENV_FILE."
+}
+
+# ------------------------------------------------------------------ models ---
+
+cmd_model() {
+  local sub=${1:-list}
+  [ $# -gt 0 ] && shift
+  case "$sub" in
+    list) model_list ;;
+    use) model_use "$@" ;;
+    custom) model_custom "$@" ;;
+    *) die "Unknown: myai model $sub" "Use: myai model list | myai model use <id> | myai model custom <repository> <file>" ;;
+  esac
+}
+
+model_list() {
+  local cur dir id min file bytes desc mark have listed=0
+  cur=$(env_get MODEL_FILE) || cur=""
+  dir="$(data_dir)/models"
+  say "Models (* = in use now):"
+  say ""
+  while IFS='|' read -r id min _ file bytes desc; do
+    mark=" "
+    if [ "$file" = "$cur" ]; then
+      mark="*"
+      listed=1
+    fi
+    have="not downloaded"
+    if model_file_complete "$dir/$file" "$bytes"; then have="downloaded"; fi
+    printf '%s %-8s %8s  needs %2s GB memory  %-15s %s\n' \
+      "$mark" "$id" "$(fmt_gb "$bytes")" "$min" "$have" "$desc"
+  done < <(catalog_lines)
+  if [ "$listed" = 0 ] && [ -n "$cur" ]; then
+    printf '* %-8s %s\n' "custom" "$cur"
+  fi
+  say ""
+  say "Switch with: myai model use <id>"
+  say "The files are in $dir. Delete a file you no longer use there to free disk space."
+}
+
+# Fails with advice when the disk cannot take BYTES more.
+need_disk_for() { # DIR BYTES
+  local dir=$1 need=$2 avail_kb
+  while [ ! -d "$dir" ]; do dir=$(dirname "$dir"); done
+  avail_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }') || avail_kb=""
+  [[ $avail_kb =~ ^[0-9]+$ ]] || return 0
+  if [ $((avail_kb * 1024)) -lt $((need + 2000000000)) ]; then
+    die "Not enough free disk space: $(fmt_gb $((avail_kb * 1024))) free, $(fmt_gb "$need") plus 2 GB reserve needed." \
+      "Delete a model file you no longer use (see: myai model list) or old backups in $APP_DIR/backups."
+  fi
+}
+
+# Point the settings at another model file and load it. When the new model
+# does not load, the previous one is put back.
+switch_model() { # ID FILE
+  local id=$1 file=$2 old_id old_file rc=0
+  old_id=$(env_get MODEL_ID) || old_id=""
+  old_file=$(env_get MODEL_FILE) || old_file=""
+  if [ "$old_id" = "$id" ] && [ "$old_file" = "$file" ]; then
+    say "The model '$id' is already in use."
+    return 0
+  fi
+  env_set MODEL_ID "$id"
+  env_set MODEL_FILE "$file"
+  if stack_is_stopped || [ "$(svc_state llm)" = missing ]; then
+    say "Model set to '$id'. It is loaded at the next start: myai start"
+    return 0
+  fi
+  say "Loading the new model. This takes a few minutes; the chat is unavailable meanwhile."
+  dc up -d --no-deps llm
+  wait_healthy llm 1800 "the model to load" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    dc logs --tail 15 llm 2>&1 | sed 's/^/      | /' >&2 || true
+    warn "The new model did not load. Going back to the previous one."
+    env_set MODEL_ID "$old_id"
+    env_set MODEL_FILE "$old_file"
+    dc up -d --no-deps llm || true
+    die "The model '$id' could not be loaded (its last messages are above)." \
+      "The usual cause is too little memory for it." \
+      "The previous model is loading again. Check in a few minutes: myai status"
+  fi
+  say "Now using the model '$id'."
+}
+
+model_use() {
+  local id=${1:-} repo file bytes min dir have=0
+  [ -n "$id" ] || die "Which model? Say: myai model use <id>" "The list: myai model list"
+  catalog_field "$id" 1 >/dev/null || die "There is no model called '$id'." "The list: myai model list"
+  min=$(catalog_field "$id" 2)
+  repo=$(catalog_field "$id" 3)
+  file=$(catalog_field "$id" 4)
+  bytes=$(catalog_field "$id" 5)
+  dir="$(data_dir)/models"
+  if ! ram_fits "$(hw_ram_kb)" "$min"; then
+    warn "'$id' is meant for servers with at least $min GB of memory; this one has $(fmt_ram "$(hw_ram_kb)")."
+    confirm "Use it anyway?" || die "Nothing was changed." "To go ahead without the question, add --yes"
+  fi
+  acquire_lock
+  if ! model_file_complete "$dir/$file" "$bytes"; then
+    have=$(file_size "$dir/$file.part") || have=0
+    need_disk_for "$dir" $((bytes - have))
+  fi
+  download_model "$repo" "$file" "$bytes" "$dir"
+  switch_model "$id" "$file"
+}
+
+model_custom() {
+  local repo=${1:-} file=${2:-} dir
+  if [ -z "$repo" ] || [ -z "$file" ]; then
+    die "Say: myai model custom <huggingface repository> <file>" \
+      "Example: myai model custom someone/Some-Model-GGUF Some-Model-Q4_K_M.gguf"
+  fi
+  [[ $repo =~ ^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$ ]] ||
+    die "'$repo' is not a Hugging Face repository name." "It looks like: owner/name"
+  [[ $file =~ ^[A-Za-z0-9][A-Za-z0-9._/-]*\.gguf$ ]] && [[ $file != *..* ]] ||
+    die "'$file' is not a GGUF file name." "It must end in .gguf, for example Some-Model-Q4_K_M.gguf"
+  dir="$(data_dir)/models"
+  acquire_lock
+  download_model "$repo" "$file" "" "$dir"
+  switch_model custom "$(basename "$file")"
+}
+
+# ---------------------------------------------------------------- thinking ---
+
+cmd_think() {
+  local mode=${1:-}
+  case "$mode" in
+    on | off | auto) ;;
+    *)
+      die "Say: myai think on, myai think off or myai think auto" \
+        "on = the agent always reasons first (better answers, much slower)" \
+        "off = never" \
+        "auto = not in chat, but for background and scheduled tasks (the default)"
+      ;;
+  esac
+  acquire_lock
+  env_set AGENT_THINKING "$mode"
+  apply_to agent
+  say "Agent thinking is now: $mode"
+}
+
+# ---------------------------------------------------------------- telegram ---
+
+cmd_telegram() {
+  local token code
+  if [ "${1:-}" = set ]; then
+    shift
+    telegram_set "$@"
+    return 0
+  fi
+  [ $# -eq 0 ] || die "Unknown: myai telegram $*" "Use: myai telegram   or: myai telegram set"
+  token=$(env_get TELEGRAM_BOT_TOKEN) || token=""
+  code=$(env_get PAIRING_CODE) || code="(missing)"
+  if [ -n "$token" ]; then
+    say "A Telegram bot token is stored."
+  else
+    say "No Telegram bot is connected yet."
+  fi
+  cat <<EOF
+
+To use your server from Telegram:
+  1. In Telegram, write to @BotFather. Send /newbot and follow its questions.
+     It gives you a token that looks like 123456789:AAE...
+  2. On this server run:   myai telegram set
+     and paste the token.
+  3. Open your new bot in Telegram and send it this message:
+
+       /pair $code
+
+     The first person who sends the right code becomes the owner.
+     After that the bot ignores everybody else.
+EOF
+}
+
+telegram_set() {
+  local token=${1:-} code
+  if [ -z "$token" ]; then
+    have_tty || die "Give the token as well: myai telegram set <token>"
+    printf 'Paste the token from @BotFather and press Enter (it is not shown): ' >/dev/tty
+    IFS= read -r -s token </dev/tty || token=""
+    printf '\n' >/dev/tty
+  fi
+  [[ $token =~ ^[0-9]{5,}:[A-Za-z0-9_-]{30,}$ ]] ||
+    die "That does not look like a bot token." \
+      "A token is a number, a colon and a long code: 123456789:AAE..." \
+      "Copy it again from your chat with @BotFather."
+  acquire_lock
+  env_set TELEGRAM_BOT_TOKEN "$token"
+  apply_to agent
+  code=$(env_get PAIRING_CODE) || code="(missing)"
+  say "The token is stored."
+  say "Now open your bot in Telegram and send it:   /pair $code"
+}
+
+# ------------------------------------------------------------------- bench ---
+
+BENCH_PROMPT="Explain in about 80 words why the sky is blue."
+
+# One measurement through the gateway: prints tokens per second.
+bench_measure() {
+  local out speed
+  # A first short request so that start-up work is not part of the timing.
+  gateway_chat "Say OK." 4 600 >/dev/null 2>&1 || true
+  out=$(gateway_chat "$BENCH_PROMPT" 96 900) || true
+  out=${out##*$'\n'}
+  case "$out" in
+    "ok "*)
+      read -r _ speed _ <<<"$out" || true
+      printf '%s\n' "$speed"
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# bench_pick: reads lines "threads tokens_per_second" and prints the smallest
+# thread count that is within 10% of the best speed. Fails when nothing was
+# measured.
+bench_pick() {
+  awk '
+    $2 + 0 > 0 { c++; n[c] = $1 + 0; s[c] = $2 + 0; if (s[c] > best) best = s[c] }
+    END {
+      if (c == 0) exit 1
+      pick = -1
+      for (i = 1; i <= c; i++)
+        if (s[i] * 10 >= best * 9 && (pick < 0 || n[i] < pick)) pick = n[i]
+      print pick
+    }'
+}
+
+# Put the earlier thread count back when the benchmark did not finish.
+bench_cleanup() {
+  if [ -n "$BENCH_RESTORE" ]; then
+    printf '\nThe benchmark did not finish. Putting back %s threads.\n' "$BENCH_RESTORE" >&2
+    env_set LLM_THREADS "$BENCH_RESTORE" || true
+    BENCH_RESTORE=""
+    dc up -d --no-deps llm >/dev/null 2>&1 || true
+  fi
+}
+
+cmd_bench() {
+  local vcpus n first=4 speed table="" pick orig rc
+  vcpus=$(hw_vcpus)
+  if [ "$vcpus" -lt 4 ]; then first=1; fi
+  if stack_is_stopped || [ "$(svc_state llm)" != healthy ] || [ "$(svc_state agent)" != healthy ]; then
+    die "The model must be running for the benchmark." "Start it: myai start   and check: myai status"
+  fi
+  say "This measures how fast the model writes with $first to $vcpus threads."
+  say "The model server is restarted for every measurement, so the chat is"
+  say "unavailable for about $(((vcpus - first + 2) * 2)) minutes."
+  confirm "Start the benchmark now?" || die "Nothing was changed." "To start without the question: myai bench --yes"
+  acquire_lock
+  orig=$(env_get LLM_THREADS) || orig=$vcpus
+  BENCH_RESTORE=$orig
+  trap myai_cleanup EXIT
+
+  say ""
+  say "  threads   speed"
+  n=$first
+  while [ "$n" -le "$vcpus" ]; do
+    speed=0
+    rc=0
+    env_set LLM_THREADS "$n"
+    if dc up -d --no-deps llm >/dev/null 2>&1; then
+      wait_healthy llm 1800 "the model with $n threads" || rc=$?
+      if [ "$rc" -eq 0 ]; then speed=$(bench_measure) || speed=0; fi
+    fi
+    table+="$n $speed"$'\n'
+    if [ "$speed" = 0 ]; then
+      printf '  %7s   %s\n' "$n" "failed"
+    else
+      printf '  %7s   %s tokens per second\n' "$n" "$speed"
+    fi
+    n=$((n + 1))
+  done
+
+  if ! pick=$(printf '%s' "$table" | bench_pick); then
+    die "No measurement worked." "Look at: myai doctor   and: myai logs llm"
+  fi
+  env_set LLM_THREADS "$pick"
+  BENCH_RESTORE=""
+  dc up -d --no-deps llm >/dev/null 2>&1 || die "The model server could not be restarted." "See: myai logs llm"
+  rc=0
+  wait_healthy llm 1800 "the model with $pick threads" || rc=$?
+  if [ "$rc" -ne 0 ]; then warn "The model server is not ready yet. Check: myai status"; fi
+
+  cat <<EOF
+
+Kept: $pick threads (it was $orig).
+
+Why not simply the most threads? On Hostinger a server may use about 60% of
+its CPU all the time. Above that it spends "CPU credits", and when they are
+used up Hostinger slows the whole server down for a while. Fewer threads
+spend fewer credits. So the smallest number of threads that is nearly as
+fast as the best one (within 10%) is kept.
+EOF
+}
+
+# ------------------------------------------------------------------ backup ---
+
+# backup_archive OUT: write settings and data (without the model files) to
+# OUT. The archive always holds ".env" and "data/...", wherever DATA_DIR is.
+backup_archive() {
+  local out=$1 data rc=0
+  data=$(data_dir)
+  # The rename applies to file names and hard links, not to where symbolic
+  # links point (flag S). ".restore.*" is the unpacked copy a restore works
+  # with; it never belongs in a backup.
+  tar -czf "$out" -C "$APP_DIR" .env \
+    -C "$data" --anchored --exclude=./models --exclude='./.restore.*' \
+    --transform='s,^\./,data/,S;s,^\.$,data,S' . || rc=$?
+  # 1 means a file changed while it was read (the proxy keeps writing);
+  # the archive is still usable.
+  if [ "$rc" -gt 1 ]; then return "$rc"; fi
+  return 0
+}
+
+# Keep the newest KEEP archives. Their names sort by date.
+rotate_backups() { # DIR KEEP
+  local dir=$1 keep=$2 files=() f i
+  for f in "$dir"/myai-*.tar.gz; do
+    if [ -f "$f" ]; then files+=("$f"); fi
+  done
+  i=0
+  while [ $((${#files[@]} - i)) -gt "$keep" ]; do
+    rm -f -- "${files[$i]}"
+    i=$((i + 1))
+  done
+}
+
+# Runs when "myai backup" ends, however it ends: the chat and the agent are
+# started again and a half-written archive is removed.
+backup_cleanup() {
+  if [ -n "$BACKUP_TMP" ]; then rm -f -- "$BACKUP_TMP"; fi
+  if [ ${#BACKUP_STOPPED[@]} -gt 0 ]; then
+    if ! dc up -d --no-deps "${BACKUP_STOPPED[@]}" >/dev/null 2>&1; then
+      warn "Could not start again: ${BACKUP_STOPPED[*]}. Run: myai start"
+    fi
+    BACKUP_STOPPED=()
+  fi
+}
+
+# make_backup [keep-all]: prints nothing but progress; the archive path is in
+# BACKUP_FILE. With keep-all no older archive is deleted: a restore deletes
+# no backup, least of all the one it restores.
+make_backup() {
+  local keep_all=${1:-} dir="$APP_DIR/backups" svc out
+  mkdir -p "$dir"
+  chmod 700 "$dir"
+  # A name of its own: never write over an archive that is already there.
+  out="$dir/myai-$(date +%Y%m%d-%H%M%S).tar.gz"
+  while [ -e "$out" ]; do
+    sleep 1
+    out="$dir/myai-$(date +%Y%m%d-%H%M%S).tar.gz"
+  done
+  BACKUP_TMP="$out.tmp"
+  BACKUP_STOPPED=()
+  # The chat and the agent keep their data in database files; they are
+  # stopped for the copy so that the files are consistent.
+  for svc in webui agent; do
+    if svc_is_up "$svc"; then BACKUP_STOPPED+=("$svc"); fi
+  done
+  trap myai_cleanup EXIT
+  if [ ${#BACKUP_STOPPED[@]} -gt 0 ]; then
+    dc stop "${BACKUP_STOPPED[@]}" >/dev/null 2>&1 ||
+      die "Could not stop the chat and the agent for the backup." "See: myai status"
+  fi
+  (umask 077 && backup_archive "$BACKUP_TMP") ||
+    die "The backup could not be written." \
+      "Check the free disk space: df -h $APP_DIR" \
+      "The chat and the agent are being started again."
+  mv -f -- "$BACKUP_TMP" "$out"
+  BACKUP_TMP=""
+  backup_cleanup
+  if [ "$keep_all" != keep-all ]; then rotate_backups "$dir" "$BACKUP_KEEP"; fi
+  BACKUP_FILE=$out
+}
+
+cmd_backup() {
+  acquire_lock
+  make_backup
+  say "Backup written: $BACKUP_FILE ($(fmt_gb "$(file_size "$BACKUP_FILE")"))"
+  say "It holds the settings, chats, agent data and files, not the model files."
+  say "The newest $BACKUP_KEEP backups are kept. Copy one to another computer now and then:"
+  say "a backup on the same server does not survive losing the server."
+}
+
+# ----------------------------------------------------------------- restore ---
+# A restore unpacks the backup into a folder next to the data first, so a
+# backup that cannot be unpacked changes nothing. Only then are the services
+# stopped and the folders exchanged, by renaming: the current ones are moved
+# aside, and put back when anything fails before the restore is complete.
+
+# restore_swap DATA STAGE: put the unpacked folders in place. The ones of the
+# backup replace the current ones, and so do the four that myai backs up even
+# when the backup lacks one. The models stay.
+restore_swap() {
+  local data=$1 stage=$2 path name names=(webui agent workspace caddy)
+  for path in "$stage/data"/* "$stage/data"/.[!.]* "$stage/data"/..?*; do
+    [ -e "$path" ] || [ -L "$path" ] || continue
+    name=${path##*/}
+    case "$name" in
+      webui | agent | workspace | caddy | models) ;;
+      *) names+=("$name") ;;
+    esac
+  done
+  mkdir -p "$stage/old" || return 1
+  for name in "${names[@]}"; do
+    if [ -e "$data/$name" ] || [ -L "$data/$name" ]; then
+      mv -- "$data/$name" "$stage/old/$name" || return 1
+    fi
+    RESTORE_MOVED+=("$name")
+    if [ -e "$stage/data/$name" ] || [ -L "$stage/data/$name" ]; then
+      mv -- "$stage/data/$name" "$data/$name" || return 1
+    fi
+  done
+}
+
+# The settings file of the backup replaces the current one, which is kept
+# aside until the restore is complete.
+restore_env_file() {
+  local stage=$1
+  cp -p -- "$ENV_FILE" "$stage/old/.env" || return 1
+  RESTORE_ENV_SAVED=1
+  (umask 077 && cp -- "$stage/.env" "$ENV_FILE.restore") &&
+    chmod 600 -- "$ENV_FILE.restore" && mv -f -- "$ENV_FILE.restore" "$ENV_FILE"
+}
+
+# Undo a restore that stopped half-way. Fails when something could not be
+# put back; the folders from before then stay in the staging folder.
+restore_roll_back() {
+  local data=$RESTORE_DATA stage=$RESTORE_STAGE name ok=0
+  for name in ${RESTORE_MOVED[@]+"${RESTORE_MOVED[@]}"}; do
+    [ -n "$name" ] || continue # never the data folder itself
+    rm -rf -- "${data:?}/$name" || ok=1
+    if [ -e "$stage/old/$name" ] || [ -L "$stage/old/$name" ]; then
+      mv -- "$stage/old/$name" "$data/$name" || ok=1
+    fi
+  done
+  RESTORE_MOVED=()
+  if [ "$RESTORE_ENV_SAVED" = 1 ]; then
+    cp -p -- "$stage/old/.env" "$ENV_FILE" || ok=1
+    RESTORE_ENV_SAVED=0
+  fi
+  rm -f -- "$ENV_FILE.restore"
+  return "$ok"
+}
+
+# Runs when "myai restore" ends, however it ends: a restore that did not
+# finish is undone, the unpacked copy is removed, the services start again.
+restore_cleanup() {
+  if [ -n "$RESTORE_STAGE" ]; then
+    if [ "$RESTORE_DONE" != 1 ] && ! restore_roll_back; then
+      warn "Not everything could be put back as it was. Nothing is started."
+      warn "The folders from before are in $RESTORE_STAGE/old; the state from before is also in ${BACKUP_FILE:-the newest backup}."
+      RESTORE_STAGE=""
+      RESTORE_RESTART=0
+      return 0
+    fi
+    rm -rf -- "$RESTORE_STAGE"
+    RESTORE_STAGE=""
+  fi
+  if [ "$RESTORE_RESTART" = 1 ]; then
+    RESTORE_RESTART=0
+    if ! stack_is_stopped; then
+      dc up -d --remove-orphans >/dev/null 2>&1 || warn "Could not start the services. Run: myai start"
+    fi
+  fi
+}
+
+cmd_restore() {
+  local file=${1:-} data list
+  [ -n "$file" ] || die "Which backup? Say: myai restore <file>" "Your backups: ls -lh $APP_DIR/backups"
+  if [ ! -f "$file" ] && [ -f "$APP_DIR/backups/$file" ]; then file="$APP_DIR/backups/$file"; fi
+  [ -f "$file" ] || die "There is no file '$file'." "Your backups: ls -lh $APP_DIR/backups"
+  file=$(readlink -f "$file")
+  list=$(tar -tzf "$file" 2>/dev/null) || die "'$file' cannot be read as a backup." "Choose another file: ls -lh $APP_DIR/backups"
+  # Only what "myai backup" writes is accepted: .env and data/...
+  if printf '%s\n' "$list" | grep -q -v -E '^(\.env|data(/.*)?)$' ||
+    printf '%s\n' "$list" | grep -q -E '(^|/)\.\.(/|$)' ||
+    ! printf '%s\n' "$list" | grep -qx -F '.env'; then
+    die "'$file' was not made by \"myai backup\"." "Choose another file: ls -lh $APP_DIR/backups"
+  fi
+
+  say "This replaces the current settings, chats, agent data and files with the"
+  say "content of: $file"
+  say "The model files stay. The current state is saved as a backup first."
+  confirm "Restore now?" || die "Nothing was changed." "To restore without the question, add --yes"
+
+  acquire_lock
+  data=$(data_dir)
+  mkdir -p "$data"
+  trap myai_cleanup EXIT
+  RESTORE_DATA=$data
+  RESTORE_STAGE=$(mktemp -d "$data/.restore.XXXXXX") ||
+    die "Could not make a folder for unpacking the backup in $data." "Nothing was changed. Check the free disk space: df -h $data"
+  say "Unpacking the backup ..."
+  tar -xzpf "$file" -C "$RESTORE_STAGE" --anchored --exclude=data/models ||
+    die "The backup could not be unpacked." "Nothing was changed. Check the free disk space: df -h $data"
+
+  say "Saving the current state ..."
+  make_backup keep-all
+  say "Saved as $BACKUP_FILE"
+
+  RESTORE_RESTART=1
+  dc down --remove-orphans >/dev/null 2>&1 || die "Could not stop the services." "Nothing was changed. See: myai status"
+  if ! { restore_swap "$data" "$RESTORE_STAGE" && restore_env_file "$RESTORE_STAGE"; }; then
+    die "The restore could not put the files of the backup in place." \
+      "The state from before is put back and the services are started again."
+  fi
+  # The data belongs here, whatever folder the backup was made in, and its
+  # folders need their owners: the agent cannot start in a folder it may not
+  # write to.
+  env_set DATA_DIR "$data"
+  make_data_dirs "$data" >/dev/null ||
+    die "Could not give the data folders their owners." "The state from before is put back and the services are started again."
+  RESTORE_DONE=1
+  if ! file_is_gguf "$(model_path)"; then
+    RESTORE_RESTART=0
+    warn "The backup uses a model file that is not on this server: $(model_path)"
+    say "Restored. Download the model, then everything starts: myai model list"
+    return 0
+  fi
+  say "Restored. Starting the services ..."
+  restore_cleanup
+  if stack_is_stopped; then
+    say "myai was stopped before and stays stopped. Start it with: myai start"
+  else
+    wait_ready
+  fi
+  say "If this backup came from another server, set the address of this one:"
+  say "run the installer again with --domain <name>."
+}
+
+# --------------------------------------------------------------- uninstall ---
+
+cmd_uninstall() {
+  local purge=0 unit units="$MYAI_SYSROOT/etc/systemd/system"
+  if [ "${1:-}" = --purge ]; then purge=1; fi
+  if [ "$purge" = 1 ]; then
+    say "This removes myai and DELETES everything in $APP_DIR:"
+    say "settings, chats, agent data, files, backups and the model files."
+  else
+    say "This removes the myai services, the timers and the myai command."
+    say "Your settings, data, backups and model files in $APP_DIR are kept."
+  fi
+  confirm "Remove myai from this server?" || die "Nothing was removed." "To remove without the question, add --yes"
+  acquire_lock
+
+  if has_systemd; then
+    systemctl disable --now myai-backup.timer myai-heal.timer >/dev/null 2>&1 || true
+  fi
+  for unit in myai-backup.service myai-backup.timer myai-heal.service myai-heal.timer; do
+    rm -f -- "$units/$unit"
+  done
+  if has_systemd; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+  dc down --remove-orphans --volumes --rmi local || warn "Some containers could not be removed. See: docker ps -a"
+  rm -f -- "$MYAI_SYSROOT/usr/local/bin/myai"
+
+  if [ "$purge" = 1 ]; then
+    if [[ $APP_DIR =~ ^/[A-Za-z0-9._-]+(/[A-Za-z0-9._-]+)+$ ]] && [ -f "$APP_DIR/docker-compose.yml" ] &&
+      [ -f "$APP_DIR/bin/myai" ]; then
+      rm -rf -- "$APP_DIR"
+      rm -f -- "$MYAI_SYSROOT/root/myai-credentials.txt"
+      say "Removed myai and deleted $APP_DIR."
+    else
+      warn "$APP_DIR does not look like a myai folder; it was not deleted."
+    fi
+  else
+    say "Removed. Kept: $APP_DIR"
+    say "To delete that as well: rm -rf $APP_DIR"
+  fi
+  say "Left as they are: Docker and its downloaded images (free the space with: docker image prune -a),"
+  say "the firewall, fail2ban, automatic updates and the swap file."
+}
+
+# -------------------------------------------------------------------- heal ---
+# Run by a timer every 5 minutes. Says nothing unless it does something.
+
+cmd_heal() {
+  local svc
+  if stack_is_stopped; then return 0; fi
+  acquire_lock try || return 0
+  if ! file_is_gguf "$(model_path)"; then return 0; fi
+  dc up -d --remove-orphans >/dev/null 2>&1 || say "myai heal: could not bring the services up (docker compose up failed)"
+  for svc in $MYAI_SERVICES; do
+    if [ "$(svc_state "$svc")" = unhealthy ]; then
+      say "myai heal: $svc does not answer; restarting it"
+      dc restart "$svc" >/dev/null 2>&1 || say "myai heal: restarting $svc failed"
+    fi
+  done
+}
+
+# ------------------------------------------------------------------ doctor ---
+
+doc_ok() { printf '  [ok]       %s\n' "$1"; }
+
+doc_look() {
+  local line
+  DOC_LOOK=$((DOC_LOOK + 1))
+  printf '  [look]     %s\n' "$1"
+  shift
+  for line in "$@"; do printf '             %s\n' "$line"; done
+}
+
+doc_bad() {
+  local line
+  DOC_BAD=$((DOC_BAD + 1))
+  printf '  [PROBLEM]  %s\n' "$1"
+  shift
+  for line in "$@"; do printf '             %s\n' "$line"; done
+}
+
+doctor_address() {
+  local site tls ip records v6
+  site=$(env_get SITE_ADDRESS) || site=""
+  tls=$(env_get CADDY_TLS_LINE) || tls=""
+  if [ -z "$site" ]; then
+    doc_bad "The address (SITE_ADDRESS) is missing in $ENV_FILE." "Run the installer again; it keeps your data."
+    return 0
+  fi
+  if [ "$site" = localhost ]; then
+    doc_look "The address is \"localhost\": only this machine itself can open the chat." \
+      "Give the server a public name: run the installer again with --domain <name>"
+    return 0
+  fi
+  if is_ipv4 "$site"; then
+    if tls_is_self_signed "$tls"; then
+      doc_ok "Address: the bare IP address $site (self-signed certificate)."
+    else
+      doc_ok "Address: the bare IP address $site."
+    fi
+    return 0
+  fi
+  if ! command -v dig >/dev/null 2>&1; then
+    doc_look "DNS cannot be checked because the tool \"dig\" is missing." "Install it: apt-get install -y dnsutils"
+    return 0
+  fi
+  ip=$(detect_public_ipv4) || ip=""
+  records=$(dns_records A "$site" | paste -sd' ' -) || records=""
+  if [ -z "$records" ]; then
+    doc_bad "The name $site is not known in public DNS." \
+      "Create an A record for it that points to ${ip:-the public address of this server}." \
+      "Without it nobody can reach the server and no certificate can be issued."
+  elif [ -n "$ip" ] && ! grep -qwF -- "$ip" <<<"$records"; then
+    doc_bad "The name $site points to $records, but this server's public address is $ip." \
+      "Correct the A record at your domain provider."
+  else
+    doc_ok "DNS: $site points to this server ($records)."
+  fi
+  if ! tls_is_self_signed "$tls"; then
+    v6=$(dns_records AAAA "$site" | paste -sd' ' -) || v6=""
+    if [ -n "$v6" ] && ! ip -6 -o addr show scope global 2>/dev/null | grep -qF -- "${v6%% *}"; then
+      doc_look "$site also has an IPv6 address ($v6) that is not on this server." \
+        "The certificate can fail because of it. Remove or correct that DNS record (type AAAA)."
+    fi
+  fi
+}
+
+doctor_ports() {
+  local port users
+  for port in 80 443; do
+    if port_is_ours "$port" tcp; then
+      doc_ok "Port $port is served by the myai proxy."
+      continue
+    fi
+    users=""
+    if command -v ss >/dev/null 2>&1; then
+      users=$(port_users tcp "$port" | paste -sd' ' -) || users=""
+    fi
+    if [ -n "$users" ]; then
+      doc_bad "Port $port is used by another program ($users), so the myai proxy cannot use it." \
+        "Stop that program, then run: myai restart caddy"
+    else
+      doc_bad "Nothing answers on port $port: the myai proxy is not running." "Start it: myai start"
+    fi
+  done
+}
+
+doctor_https() {
+  local site tls code rc=0 end secs days insecure="" advice=()
+  site=$(env_get SITE_ADDRESS) || site=""
+  tls=$(env_get CADDY_TLS_LINE) || tls=""
+  [ -n "$site" ] || return 0
+  # Only a self-signed certificate is accepted without checking it; every
+  # other one must be valid, whichever certificate service issued it.
+  if tls_is_self_signed "$tls"; then insecure=-k; fi
+  # Ask the proxy on this machine itself, under the public name.
+  code=$(curl -sS -o /dev/null -m 15 -w '%{http_code}' --resolve "$site:443:127.0.0.1" \
+    ${insecure:+"$insecure"} "https://$site/" 2>/dev/null) || rc=$?
+  case "$rc" in
+    0)
+      if [ -n "$insecure" ]; then
+        doc_ok "HTTPS answers (self-signed certificate, as configured)."
+        return 0
+      fi
+      doc_ok "HTTPS answers with a valid certificate (status $code)."
+      ;;
+    35 | 60) # 35: no certificate to offer at all yet; 60: one that is not trusted
+      advice=("In the first minute after a start this is normal. Otherwise the cause is one of:"
+        "- The name does not point to this server (see DNS above)."
+        "- Ports 80 and 443 are closed in your provider's firewall (Hostinger: hPanel, VPS, Security, Firewall).")
+      if tls_contact "$tls" >/dev/null; then
+        advice+=("- The certificate services refused the contact address in CADDY_TLS_LINE. If the proxy's"
+          "  messages say so, empty that line in $ENV_FILE and run: myai restart caddy")
+      fi
+      case "$site" in
+        *.sslip.io)
+          advice+=("- The weekly limit that all names ending in sslip.io share is used up. Use your own domain (--domain).")
+          if [ -z "$tls" ]; then
+            advice+=("  Or let a second service (ZeroSSL) step in: give a real e-mail address of yours as the contact,"
+              "  CADDY_TLS_LINE='tls you@your-domain' in $ENV_FILE, then run: myai restart caddy")
+          fi
+          ;;
+      esac
+      doc_bad "The certificate for $site is not valid (yet)." "${advice[@]}" "What the proxy says: myai logs caddy"
+      return 0
+      ;;
+    7)
+      doc_bad "The proxy does not accept connections on port 443." "Start it: myai start   Then look at: myai logs caddy"
+      return 0
+      ;;
+    *)
+      doc_bad "The HTTPS check failed (curl error $rc)." "What the proxy says: myai logs caddy"
+      return 0
+      ;;
+  esac
+  end=$(openssl s_client -connect 127.0.0.1:443 -servername "$site" </dev/null 2>/dev/null |
+    openssl x509 -noout -enddate 2>/dev/null) || end=""
+  end=${end#notAfter=}
+  if [ -n "$end" ] && secs=$(date -d "$end" +%s 2>/dev/null); then
+    days=$(((secs - $(date +%s)) / 86400))
+    if [ "$days" -lt 14 ]; then
+      doc_look "The certificate ends in $days days and was not renewed yet." "What the proxy says: myai logs caddy"
+    else
+      doc_ok "The certificate is valid for another $days days (it renews itself)."
+    fi
+  fi
+}
+
+doctor_services() {
+  local svc state
+  if stack_is_stopped; then
+    doc_look "myai was stopped with \"myai stop\"." "Start it: myai start"
+    return 0
+  fi
+  for svc in $MYAI_SERVICES; do
+    state=$(svc_state "$svc")
+    case "$state" in
+      healthy | running) doc_ok "Service $svc: $(state_words "$state")." ;;
+      starting) doc_look "Service $svc is still starting." "The model needs a few minutes after a start. Look again soon." ;;
+      *) doc_bad "Service $svc: $(state_words "$state")." "Its messages: myai logs $svc   Try: myai restart $svc" ;;
+    esac
+  done
+}
+
+doctor_model() {
+  local file
+  file=$(model_path)
+  if file_is_gguf "$file"; then
+    doc_ok "Model file: $(basename "$file") ($(fmt_gb "$(file_size "$file")"))."
+  else
+    doc_bad "The model file is missing or damaged: $file" "Download it: myai model use <id>   (the list: myai model list)"
+  fi
+}
+
+# Does the model server build know every setting that docker-compose.yml
+# gives it? It ignores an environment variable it does not know without a
+# word, and stops at once on an option it does not know.
+doctor_llm_settings() {
+  local image lost vars opts name meaning serious=0 lines=()
+  image=$(env_get LLAMA_IMAGE) || image=""
+  image=${image:-ghcr.io/ggml-org/llama.cpp:server}
+  if ! lost=$(llama_lost_settings "$image" "$APP_DIR/docker-compose.yml"); then
+    doc_look "Could not check which settings the model server knows: its program could not say." \
+      "If the chat works, nothing needs to be done. Otherwise look at: myai logs llm"
+    return 0
+  fi
+  if [ -z "$lost" ]; then
+    doc_ok "The model server knows all the settings that myai gives it."
+    return 0
+  fi
+  vars=$(grep -v -- '^--' <<<"$lost") || vars=""
+  opts=$(grep -- '^--' <<<"$lost") || opts=""
+  if [ -n "$opts" ]; then
+    for name in $opts; do
+      meaning=$(llama_setting_meaning "$name")
+      lines+=("- $name: ${meaning#*|}")
+    done
+    doc_bad "This build of the model server does not know $(count_lines "$opts") of the options that myai gives it, so it cannot start:" \
+      "${lines[@]}" "A newer myai may know the new names: myai update"
+  fi
+  [ -n "$vars" ] || return 0
+  lines=()
+  for name in $vars; do
+    meaning=$(llama_setting_meaning "$name")
+    if [ "${meaning%%|*}" = serious ]; then serious=1; fi
+    lines+=("- $name: ${meaning#*|}")
+  done
+  lines+=("This build of the model server (llama.cpp) knows these settings under other names, or not at all."
+    "A newer myai may know the new names: myai update")
+  if [ "$serious" = 1 ]; then
+    doc_bad "The model server ignores $(count_lines "$vars") of the settings that myai gives it:" "${lines[@]}"
+  else
+    doc_look "The model server ignores $(count_lines "$vars") of the settings that myai gives it:" "${lines[@]}"
+  fi
+}
+
+# Out-of-memory stops of the model server, and whether it holds the model
+# twice. Says nothing while it loads, when it is stopped, or when the numbers
+# cannot be read.
+doctor_llm_memory() {
+  local kills kb own file swap size ctx cache used in_swap="" id advice=()
+  if stack_is_stopped || ! llm_facts; then return 0; fi
+  kills=$(llm_oom_kills)
+  if [ "$kills" -gt 0 ]; then
+    advice=("The model needs more memory than this server has free. What helps:")
+    id=$(env_get MODEL_ID) || id=""
+    case "$id" in
+      fast) ;;
+      classic) advice+=("- a smaller model: myai model use fast   (much weaker)") ;;
+      hauhau | heretic | huihui) advice+=("- a smaller model: myai model use classic   (or the much weaker: myai model use fast)") ;;
+      *) advice+=("- a smaller model: myai model list") ;;
+    esac
+    advice+=("- less memory for conversations: in $ENV_FILE set LLM_CTX=16384, AGENT_CTX_TOKENS=6000"
+      "  and LLM_CACHE_RAM_MIB=512 (the values for small servers), then run: myai restart"
+      "- if a line above says that the model server ignores the switch that keeps a single copy"
+      "  of the model in memory, that is the cause: myai update")
+    doc_bad "The system stopped the model server $kills time(s) because the memory ran out." "${advice[@]}"
+  elif [ "$LLM_RESTARTS" -gt 0 ] && svc_is_up llm; then
+    doc_look "The model server has restarted $LLM_RESTARTS time(s) since it was set up." \
+      "If the chat stops answering now and then, its messages say why: myai logs llm"
+  fi
+  [ "$(svc_state llm)" = healthy ] || return 0
+  kb=$(llm_memory_kb) || return 0
+  read -r own file swap <<<"$kb"
+  size=$(file_size "$(model_path)") || return 0
+  ctx=$(env_get LLM_CTX) || ctx=32768
+  cache=$(env_get LLM_CACHE_RAM_MIB) || cache=2048
+  # A context or prompt cache without a set size (0 or -1): no limit to compare with.
+  if [[ ! $ctx =~ ^[1-9][0-9]*$ ]] || [[ ! $cache =~ ^[0-9]+$ ]]; then return 0; fi
+  used=$(((own + file) * 1024))
+  # Named from 0.1 GB on: a few MB in swap are common and say nothing.
+  if [ "$swap" -ge 100000 ]; then in_swap=" ($(fmt_gb $((swap * 1024))) of it in swap)"; fi
+  if model_held_twice "$own" "$file" "$size" "$ctx" "$cache"; then
+    doc_bad "The model server uses $(fmt_gb "$used") of memory$in_swap for a $(fmt_gb "$size") model file: it holds a second copy of the model." \
+      "llama.cpp makes that copy (\"repacking\") when it ignores the switch that myai sets." \
+      "A newer myai may fix it: myai update" \
+      "Until then a smaller model needs less memory: myai model list"
+  else
+    doc_ok "Model server memory: $(fmt_gb "$used")$in_swap for a $(fmt_gb "$size") model file."
+  fi
+}
+
+doctor_memory() {
+  local total avail swap_total swap_free
+  read -r total avail swap_total swap_free < <(awk '
+    $1 == "MemTotal:" { t = $2 } $1 == "MemAvailable:" { a = $2 }
+    $1 == "SwapTotal:" { st = $2 } $1 == "SwapFree:" { sf = $2 }
+    END { print t + 0, a + 0, st + 0, sf + 0 }' "$MYAI_SYSROOT/proc/meminfo") || true
+  if [ "${avail:-0}" -lt 524288 ]; then
+    doc_bad "Memory is almost full: $(fmt_ram "$avail") free of $(fmt_ram "$total")." \
+      "Answers become very slow. Use a smaller model: myai model use fast"
+  elif [ "$avail" -lt 1572864 ]; then
+    doc_look "Memory is tight: $(fmt_ram "$avail") free of $(fmt_ram "$total")." \
+      "If answers are slow, use a smaller model: myai model list"
+  else
+    doc_ok "Memory: $(fmt_ram "$avail") free of $(fmt_ram "$total")."
+  fi
+  if [ "${swap_total:-0}" -gt 0 ] && [ $(((swap_total - swap_free) * 2)) -gt "$swap_total" ]; then
+    doc_look "More than half of the swap space is in use: the server is short of memory." \
+      "Use a smaller model (myai model list) or restart to clear it: myai restart"
+  fi
+}
+
+doctor_disk() {
+  local dir avail_kb gb
+  dir=$(data_dir)
+  while [ ! -d "$dir" ]; do dir=$(dirname "$dir"); done
+  avail_kb=$(df -Pk "$dir" 2>/dev/null | awk 'NR == 2 { print $4 }') || avail_kb=""
+  [[ $avail_kb =~ ^[0-9]+$ ]] || return 0
+  gb=$(fmt_gb $((avail_kb * 1024)))
+  if [ "$avail_kb" -lt 3000000 ]; then
+    doc_bad "The disk is almost full: $gb free." \
+      "Delete model files you do not use (myai model list), old backups in $APP_DIR/backups," \
+      "or unused images: docker image prune -a"
+  elif [ "$avail_kb" -lt 15000000 ]; then
+    doc_look "Disk space is getting low: $gb free." "See what can go: myai model list   and: ls -lh $APP_DIR/backups"
+  else
+    doc_ok "Disk: $gb free."
+  fi
+}
+
+doctor_cpu() {
+  local a b steal busy
+  a=$(cpu_sample) || return 0
+  sleep "${MYAI_DOCTOR_SAMPLE_SECS:-3}"
+  b=$(cpu_sample) || return 0
+  read -r steal busy <<<"$(cpu_percentages "$a" "$b")" || true
+  if [ "${steal%.*}" -ge 25 ]; then
+    doc_bad "The provider is holding this server back: $steal% of the CPU time is taken away (\"steal\")." \
+      "On Hostinger this means the CPU credits are used up. Background tasks of the agent pause by themselves." \
+      "Let the server rest for half an hour. If it happens often: fewer threads (myai bench) and fewer scheduled tasks."
+  elif [ "${steal%.*}" -ge 10 ]; then
+    doc_look "CPU steal is $steal% (up to 10% is normal on a shared server)." \
+      "If it stays this high, answers are slower. It usually passes."
+  else
+    doc_ok "CPU: steal $steal% (normal), in use $busy%."
+  fi
+}
+
+doctor_schedule() {
+  local newest="" f age
+  if has_systemd; then
+    if systemctl is-active --quiet myai-heal.timer && systemctl is-active --quiet myai-backup.timer; then
+      doc_ok "Timers: the nightly backup and the 5-minute check are scheduled."
+    else
+      doc_look "The nightly backup or the 5-minute check is not scheduled." "Run the installer again; it sets them up and keeps your data."
+    fi
+  fi
+  for f in "$APP_DIR"/backups/myai-*.tar.gz; do
+    if [ -f "$f" ]; then newest=$f; fi
+  done
+  if [ -z "$newest" ]; then
+    doc_look "There is no backup yet." "Make one now: myai backup"
+  else
+    age=$((($(date +%s) - $(stat -c %Y "$newest")) / 86400))
+    if [ "$age" -gt 2 ]; then
+      doc_look "The newest backup is $age days old." "Make one now: myai backup"
+    else
+      doc_ok "Newest backup: $(basename "$newest")."
+    fi
+  fi
+}
+
+cmd_doctor() {
+  DOC_BAD=0
+  DOC_LOOK=0
+  say "Checking the server ..."
+  say ""
+  doctor_address
+  doctor_ports
+  doctor_https
+  doctor_services
+  doctor_model
+  doctor_llm_settings
+  doctor_llm_memory
+  doctor_memory
+  doctor_disk
+  doctor_cpu
+  doctor_schedule
+  say ""
+  if [ "$DOC_BAD" -eq 0 ] && [ "$DOC_LOOK" -eq 0 ]; then
+    say "All checks passed."
+  else
+    say "$DOC_BAD problem(s), $DOC_LOOK thing(s) to look at. The lines under each one say what to do."
+  fi
+  say "If the page still does not open from your phone: check that the firewall in"
+  say "your provider's panel lets TCP ports 80 and 443 through."
+  if [ "$DOC_BAD" -gt 0 ]; then return 1; fi
+}
+
+# -------------------------------------------------------------------- main ---
+
+main() {
+  local arg cmd args=()
+  for arg in "$@"; do
+    case "$arg" in
+      -y | --yes) ASSUME_YES=1 ;;
+      *) args+=("$arg") ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+  cmd=${1:-help}
+  [ $# -gt 0 ] && shift
+  case "$cmd" in
+    help | -h | --help)
+      cmd_help
+      return 0
+      ;;
+  esac
+
+  [ "$(id -u)" -eq 0 ] || die "myai must be run as root." "Try: sudo myai $cmd"
+  if [ ! -f "$APP_DIR/docker-compose.yml" ] || [ ! -f "$ENV_FILE" ]; then
+    die "myai is not set up in $APP_DIR (the settings file is missing)." \
+      "Run the install command from the README; it keeps existing data."
+  fi
+  command -v docker >/dev/null 2>&1 || die "Docker is not installed." "Run the install command from the README again."
+  secure_env_file
+  # What other commands see while this one holds the lock.
+  MYAI_LOCK_NAME="myai $cmd"
+
+  case "$cmd" in
+    status) cmd_status ;;
+    logs) cmd_logs "$@" ;;
+    start) cmd_start ;;
+    stop) cmd_stop ;;
+    restart) cmd_restart "$@" ;;
+    update) cmd_update ;;
+    link) cmd_link ;;
+    creds) cmd_creds ;;
+    doctor) cmd_doctor ;;
+    bench) cmd_bench ;;
+    model) cmd_model "$@" ;;
+    think) cmd_think "$@" ;;
+    telegram) cmd_telegram "$@" ;;
+    backup) cmd_backup ;;
+    restore) cmd_restore "$@" ;;
+    uninstall) cmd_uninstall "$@" ;;
+    heal) cmd_heal ;;
+    *) die "Unknown command: $cmd" "See the list: myai help" ;;
+  esac
+}
+
+if [ "${MYAI_SOURCE_ONLY:-0}" != 1 ]; then main "$@"; exit $?; fi

@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake qrencode: prints a marker instead of a QR code.
+echo "[QR code for ${!#}]"

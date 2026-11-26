@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake journalctl: logs the call. The kernel log of this boot is
+# $FAKE_DIR/journal_kernel; $FAKE_DIR/journal_kernel_before holds the kernel
+# lines of earlier boots, which -k, --dmesg and -b leave out, as the real
+# journalctl does.
+printf 'journalctl %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+this_boot=0
+for arg in "$@"; do
+  case "$arg" in
+    -k | --dmesg | -b* | --boot | --boot=*) this_boot=1 ;;
+  esac
+done
+if [ "$this_boot" = 0 ]; then cat "${FAKE_DIR:?}/journal_kernel_before" 2>/dev/null; fi
+cat "${FAKE_DIR:?}/journal_kernel" 2>/dev/null
+exit 0

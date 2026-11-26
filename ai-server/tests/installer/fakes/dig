@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake dig: answers come from $FAKE_DIR/dig_<TYPE>_<name> (one address per line).
+printf 'dig %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+words=()
+for arg in "$@"; do
+  case "$arg" in
+    +* | @*) ;;
+    *) words+=("$arg") ;;
+  esac
+done
+case "$*" in
+  *whoami.cloudflare*)
+    cat "$FAKE_DIR/dig_whoami" 2>/dev/null
+    exit 0
+    ;;
+esac
+cat "$FAKE_DIR/dig_${words[0]}_${words[1]}" 2>/dev/null
+exit 0

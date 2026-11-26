@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Fake ufw: logs. "allow" fails when $FAKE_DIR/ufw_fail_allow exists.
+printf 'ufw %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+if [ "${1:-}" = allow ] && [ -e "$FAKE_DIR/ufw_fail_allow" ]; then
+  echo "ERROR: problem running ufw" >&2
+  exit 1
+fi
+if [ "${1:-}" = status ]; then cat "$FAKE_DIR/ufw_status" 2>/dev/null; fi
+exit 0

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake apt-get: logs; the exit code comes from $FAKE_DIR/rc_apt-get.
+printf 'apt-get %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit "$(cat "$FAKE_DIR/rc_apt-get" 2>/dev/null || echo 0)"

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# The real install. Without root, the owner options are dropped so that the
+# tests also run as an ordinary user. The call is logged.
+printf 'install %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+if [ "$("${REAL_ID:?}" -u)" -eq 0 ]; then exec "${REAL_INSTALL:?}" "$@"; fi
+args=()
+skip=0
+for arg in "$@"; do
+  if [ "$skip" = 1 ]; then
+    skip=0
+    continue
+  fi
+  case "$arg" in
+    -o | -g) skip=1 ;;
+    *) args+=("$arg") ;;
+  esac
+done
+exec "${REAL_INSTALL:?}" "${args[@]}"

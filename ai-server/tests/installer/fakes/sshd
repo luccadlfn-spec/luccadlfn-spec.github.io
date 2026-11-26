@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Fake sshd: "sshd -T" prints $FAKE_DIR/sshd_T, or fails when that is missing.
+printf 'sshd %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+[ -f "$FAKE_DIR/sshd_T" ] || exit 1
+cat "$FAKE_DIR/sshd_T"

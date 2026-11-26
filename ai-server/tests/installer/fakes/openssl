@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# The real openssl, except "s_client" (a network connection): that prints
+# $FAKE_DIR/s_client_out instead.
+if [ "${1:-}" = s_client ]; then
+  cat "$FAKE_DIR/s_client_out" 2>/dev/null
+  exit 0
+fi
+exec "${REAL_OPENSSL:?}" "$@"
