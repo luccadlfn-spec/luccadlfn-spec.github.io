@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# The real tar, except that creating an archive fails when
+# $FAKE_DIR/tar_fail exists (a full disk, for the backup tests).
+if [ -e "$FAKE_DIR/tar_fail" ]; then
+  case " $* " in
+    *" -czf "*)
+      echo "tar: write error: No space left on device" >&2
+      exit 2
+      ;;
+  esac
+fi
+exec "${REAL_TAR:?}" "$@"

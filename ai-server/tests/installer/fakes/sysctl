@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake sysctl: only logs.
+printf 'sysctl %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit 0

@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake dd: only logs.
+printf 'dd %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit 0

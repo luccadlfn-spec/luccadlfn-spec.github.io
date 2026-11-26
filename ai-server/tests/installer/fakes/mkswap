@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake mkswap: only logs.
+printf 'mkswap %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit 0

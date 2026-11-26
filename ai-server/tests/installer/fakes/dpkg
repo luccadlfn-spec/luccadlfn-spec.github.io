@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Fake dpkg: "dpkg -s PKG" succeeds when $FAKE_DIR/dpkg_PKG exists.
+[ "${1:-}" = -s ] && [ -e "$FAKE_DIR/dpkg_${2:-}" ]

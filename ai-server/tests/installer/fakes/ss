@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake ss: listeners come from $FAKE_DIR/ss_<tcp|udp>_<port>.
+proto=tcp
+port=""
+for arg in "$@"; do
+  case "$arg" in
+    -*u*) proto=udp ;;
+    "sport = :"*) port=${arg#sport = :} ;;
+  esac
+done
+cat "$FAKE_DIR/ss_${proto}_${port}" 2>/dev/null
+exit 0

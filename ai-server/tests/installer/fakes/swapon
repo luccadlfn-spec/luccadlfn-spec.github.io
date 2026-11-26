@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Fake swapon: "--show" prints $FAKE_DIR/swapon_show; anything else is logged.
+case "$*" in
+  *--show*)
+    cat "$FAKE_DIR/swapon_show" 2>/dev/null
+    exit 0
+    ;;
+esac
+printf 'swapon %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit "$(cat "$FAKE_DIR/rc_swapon" 2>/dev/null || echo 0)"

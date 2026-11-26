@@ -1,0 +1,131 @@
+# Reverse proxy for myai. It is the only container with published ports.
+#
+# The "gate": nothing behind this proxy is reachable without a cookie that
+# holds GATE_TOKEN. Opening https://<SITE_ADDRESS>/enter/<GATE_TOKEN> once
+# sets that cookie for a year. Everyone else gets one static page and never
+# touches Open WebUI or the agent. The apps keep their own logins on top.
+#
+# Values come from the container environment (see docker-compose.yml):
+#   SITE_ADDRESS    host name only, for example srv123456.hstgr.cloud
+#   GATE_TOKEN      letters and digits only (the installer writes 32 hex characters)
+#   CADDY_TLS_LINE  empty = certificate from Let's Encrypt; "tls internal" = self-signed
+#
+# Do not add basic_auth: Open WebUI uses the Authorization header itself.
+# Do not add a log directive: the entry URL contains the token.
+{
+	admin off
+
+	# Only matters with "tls internal": nothing inside this container needs
+	# to trust the self-signed CA.
+	skip_install_trust
+
+	# Port 80 only redirects (the http:// block below does it for every host
+	# name, so Caddy's own per-site redirect is not needed). Certificates are
+	# still obtained and renewed automatically.
+	auto_https disable_redirects
+	servers :80 {
+		protocols h1
+	}
+}
+
+# Sent with every HTTPS response, error pages included. The removals also
+# strip what Open WebUI and the agent send (their Server header, for example).
+(security_headers) {
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		X-Robots-Tag "noindex, nofollow"
+		-Server
+		-Via
+	}
+}
+
+# Plain HTTP, any host name or the bare IP address: redirect to the HTTPS
+# site. Certificate challenges on port 80 are answered by Caddy before this
+# block is reached. At start Caddy logs one warning about this block ("server
+# is listening only on the HTTP port, so no automatic HTTPS will be applied to
+# this server"); that is expected, the HTTPS site below is not affected.
+http:// {
+	header -Server
+	redir https://{$SITE_ADDRESS}{uri} 308
+}
+
+{$SITE_ADDRESS} {
+	{$CADDY_TLS_LINE}
+
+	import security_headers
+
+	# 1. The entry link: set the cookie and go to the start page.
+	#    (vars compares the whole path exactly; the path matcher ignores case.)
+	@enter vars {http.request.uri.path} /enter/{$GATE_TOKEN}
+	handle @enter {
+		header Set-Cookie "myai_gate={$GATE_TOKEN}; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax"
+		header Cache-Control "no-store"
+		redir * / 302
+	}
+
+	# 2. Requests that carry the cookie. /agent keeps its path prefix; the
+	#    agent's internal API (/v1 on its own port) is therefore never exposed.
+	#    If GATE_TOKEN were empty this matcher has no value and Caddy refuses
+	#    to start, which is the safe outcome.
+	@member vars {http.request.cookie.myai_gate} {$GATE_TOKEN}
+	handle @member {
+		@agent path /agent /agent/*
+		handle @agent {
+			reverse_proxy agent:8090
+		}
+		handle {
+			reverse_proxy webui:8080
+		}
+	}
+
+	# 3. Everyone else, whatever they ask for (a wrong /enter/... included).
+	handle {
+		header Cache-Control "no-store"
+		header Content-Type "text/html; charset=utf-8"
+		header Content-Security-Policy "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+		respond <<HTML
+			<!doctype html>
+			<html lang="en">
+			<head>
+			<meta charset="utf-8">
+			<meta name="viewport" content="width=device-width, initial-scale=1">
+			<meta name="robots" content="noindex, nofollow">
+			<title>Private</title>
+			<style>
+			:root { color-scheme: light dark }
+			body { font: 16px/1.5 system-ui, sans-serif; max-width: 22rem; margin: 18vh auto 0; padding: 0 1rem }
+			input, button { font: inherit; width: 100%; box-sizing: border-box; padding: .6rem; margin-top: .6rem }
+			</style>
+			</head>
+			<body>
+			<h1>Private server</h1>
+			<p>This server is private. Enter your access code to continue.</p>
+			<form id="gate">
+			<input id="code" type="text" aria-label="Access code" placeholder="Access code" autocomplete="off" autocapitalize="none" spellcheck="false" required autofocus>
+			<button type="submit">Continue</button>
+			</form>
+			<script>
+			document.getElementById("gate").addEventListener("submit", function (event) {
+				event.preventDefault();
+				var code = document.getElementById("code").value.trim();
+				var cut = code.lastIndexOf("/enter/");
+				if (cut >= 0) { code = code.slice(cut + 7); }
+				if (code) { location.href = "/enter/" + encodeURIComponent(code); }
+			});
+			</script>
+			</body>
+			</html>
+			HTML 200
+	}
+
+	# Only members can get here (the page above cannot fail): say something
+	# useful while Open WebUI or the agent is still starting. The status code
+	# of the error (502 in that case) is kept.
+	handle_errors {
+		import security_headers
+		header Cache-Control "no-store"
+		respond "The service is starting or restarting. Try again in a minute. ({err.status_code})"
+	}
+}

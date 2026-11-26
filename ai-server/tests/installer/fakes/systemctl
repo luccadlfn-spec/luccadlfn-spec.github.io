@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake systemctl: logs; the exit code comes from $FAKE_DIR/rc_systemctl.
+printf 'systemctl %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+exit "$(cat "$FAKE_DIR/rc_systemctl" 2>/dev/null || echo 0)"

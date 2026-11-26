@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake fallocate: logs and creates an empty file instead of a large one.
+printf 'fallocate %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+: >"${!#}"

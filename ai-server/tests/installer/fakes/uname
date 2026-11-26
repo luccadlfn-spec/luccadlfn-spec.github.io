@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The real uname, unless $FAKE_DIR/uname_m gives the machine type.
+if [ "${1:-}" = -m ] && [ -s "$FAKE_DIR/uname_m" ]; then
+  cat "$FAKE_DIR/uname_m"
+  exit 0
+fi
+exec "${REAL_UNAME:?}" "$@"

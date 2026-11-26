@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Fake ip: the source address for the default route comes from $FAKE_DIR/ip_src.
+printf 'ip %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+case "$*" in
+  *"route get"*)
+    src=$(cat "$FAKE_DIR/ip_src" 2>/dev/null)
+    [ -n "$src" ] || exit 2
+    echo "1.1.1.1 via 192.0.2.1 dev eth0 src $src uid 0"
+    ;;
+  *-6*addr*) cat "$FAKE_DIR/ip6_addrs" 2>/dev/null ;;
+esac
+exit 0

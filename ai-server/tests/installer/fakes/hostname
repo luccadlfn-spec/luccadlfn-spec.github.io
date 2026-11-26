@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Fake hostname: the full name comes from $FAKE_DIR/fqdn.
+name=$(cat "$FAKE_DIR/fqdn" 2>/dev/null || echo localhost)
+case "${1:-}" in
+  -f) echo "$name" ;;
+  *) echo "${name%%.*}" ;;
+esac

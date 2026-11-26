@@ -1,0 +1,37 @@
+# SearXNG for myai: a private metasearch engine used only from inside the
+# Docker network (the agent's web_search tool and Open WebUI's web search).
+# It is never published to the internet, so the public-instance protections
+# are off. Everything not listed here keeps SearXNG's built-in defaults.
+#
+# The secret key is not in this file: the container gets it from the
+# SEARXNG_SECRET environment variable, which overrides server.secret_key.
+use_default_settings: true
+
+general:
+  instance_name: "myai search"
+  enable_metrics: false
+
+search:
+  # No result filtering.
+  safe_search: 0
+  # json is what the agent and Open WebUI request; without it they get HTTP 403.
+  formats:
+    - html
+    - json
+
+server:
+  # The rate limiter needs a Valkey server and only makes sense for public instances.
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+# This SearXNG version enables only DuckDuckGo for general web search. Turn on
+# a few more, so that one engine blocking the server's IP address does not
+# leave searches empty. An engine that fails is skipped for a while by itself.
+engines:
+  - name: bing
+    disabled: false
+  - name: brave
+    disabled: false
+  - name: google
+    disabled: false

@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Fake curl: lets requests to 127.0.0.1 through to the real curl (the local
+# test file server) and plays the few internet hosts the scripts use.
+# Anything else is refused, so the tests can never reach the network.
+D=${FAKE_DIR:?}
+printf 'curl %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+out=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "-o" ]; then out=$arg; fi
+  prev=$arg
+done
+for arg in "$@"; do
+  case "$arg" in
+    *icanhazip.com*)
+      if [ -s "$D/curl_myip" ]; then
+        cat "$D/curl_myip"
+        exit 0
+      fi
+      exit 6
+      ;;
+    *codeload.github.com/*)
+      ref=${arg##*/tar.gz/}
+      src="$D/codeload_${ref//\//_}.tar.gz"
+      [ -f "$src" ] || exit 22
+      cp "$src" "$out"
+      exit 0
+      ;;
+    *download.docker.com/*)
+      echo "fake docker key" >"$out"
+      exit 0
+      ;;
+    http://127.0.0.1:* | http://127.0.0.1/*) exec "${REAL_CURL:?}" "$@" ;;
+    https://*)
+      # The doctor's HTTPS check: status and exit code come from files.
+      if [ -s "$D/https_code" ]; then
+        cat "$D/https_code"
+        exit "$(cat "$D/https_rc" 2>/dev/null || echo 0)"
+      fi
+      echo "fake curl: no network in tests ($arg)" >&2
+      exit 6
+      ;;
+    http://*)
+      echo "fake curl: no network in tests ($arg)" >&2
+      exit 6
+      ;;
+  esac
+done
+exec "${REAL_CURL:?}" "$@"

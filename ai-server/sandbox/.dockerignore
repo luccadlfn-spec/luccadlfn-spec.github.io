@@ -1,0 +1,4 @@
+# Only server.py and requirements.txt go into the image.
+*
+!server.py
+!requirements.txt

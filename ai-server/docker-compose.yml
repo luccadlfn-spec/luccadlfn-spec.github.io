@@ -1,0 +1,310 @@
+# myai: private web chat (Open WebUI) and an always-on agent, both served by
+# one local model (llama.cpp). Everything runs on this machine.
+#
+# Settings come from the .env file next to this file (see .env.example).
+# install.sh writes it; `myai` changes it. Lines such as ${NAME:?...} stop
+# Compose with a message when a required value is missing, instead of
+# starting a service with an empty password or key.
+#
+# Rules this file keeps:
+#   - Only caddy publishes ports. Docker-published ports bypass the host
+#     firewall (ufw), so nothing else may have a "ports:" entry.
+#   - State lives in bind mounts under DATA_DIR, not in named volumes.
+#   - Open WebUI talks to the agent service only; the agent is the single
+#     gateway to the model.
+#   - No container gets the Docker socket.
+
+name: myai
+
+x-common: &common
+  restart: unless-stopped
+  security_opt:
+    - no-new-privileges:true
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # The model server. No internet access; reachable only from the agent.
+  llm:
+    <<: *common
+    image: ${LLAMA_IMAGE:-ghcr.io/ggml-org/llama.cpp:server}
+    environment:
+      LLAMA_ARG_MODEL: /models/${MODEL_FILE:?set MODEL_FILE in .env to the GGUF file name in data/models}
+      LLAMA_ARG_ALIAS: ${MODEL_ALIAS:-assistant}
+      LLAMA_ARG_HOST: 0.0.0.0
+      LLAMA_ARG_PORT: "8080"
+      LLAMA_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      # Total context, shared by the parallel slots.
+      LLAMA_ARG_CTX_SIZE: ${LLM_CTX:-32768}
+      LLAMA_ARG_N_PARALLEL: ${LLM_PARALLEL:-2}
+      LLAMA_ARG_THREADS: ${LLM_THREADS:-6}
+      LLAMA_ARG_LOAD_MODE: ${LLM_LOAD_MODE:-mmap+mlock}
+      LLAMA_ARG_CACHE_RAM: ${LLM_CACHE_RAM_MIB:-2048}
+      LLAMA_ARG_CTX_CHECKPOINTS: "8"
+      LLAMA_ARG_UI: "false"
+      # Must stay "auto": only then can each request switch thinking on or off.
+      LLAMA_ARG_REASONING: auto
+      LLAMA_ARG_THINK_BUDGET: ${LLM_THINK_BUDGET:-2048}
+      # A default only; clients send max_tokens.
+      LLAMA_ARG_N_PREDICT: "4096"
+      LLAMA_ARG_TEMPERATURE: ${LLM_TEMPERATURE:-0.7}
+      LLAMA_ARG_TOP_P: ${LLM_TOP_P:-0.8}
+      LLAMA_ARG_TOP_K: ${LLM_TOP_K:-20}
+      LLAMA_ARG_MIN_P: ${LLM_MIN_P:-0}
+      LLAMA_ARG_PRESENCE_PENALTY: ${LLM_PRESENCE_PENALTY:-1.0}
+      LLAMA_ARG_TIMEOUT: "3600"
+    # This flag has no environment variable.
+    command: ["--threads-batch", "${LLM_THREADS_BATCH:-8}"]
+    volumes:
+      - ${DATA_DIR:-./data}/models:/models:ro
+    # mlock keeps the model in RAM; it needs an unlimited locked-memory limit.
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+    networks:
+      - llm_net
+    healthcheck:
+      # 200 only once the model is loaded; loading 20 GB can take minutes.
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
+      interval: 30s
+      timeout: 20s
+      retries: 6
+      start_period: 20m
+      start_interval: 5s
+
+  # The agent: task queue, scheduler, tools, optional Telegram bot, and the
+  # OpenAI-compatible gateway that Open WebUI uses. Its image defines its own
+  # healthcheck (GET /agent/healthz).
+  agent:
+    <<: *common
+    build: ./agent
+    depends_on:
+      - llm
+      - searxng
+      - sandbox
+    environment:
+      LLM_BASE_URL: http://llm:8080/v1
+      LLM_API_KEY: ${LLM_API_KEY:?set LLM_API_KEY in .env}
+      LLM_MODEL: ${MODEL_ALIAS:-assistant}
+      AGENT_API_KEY: ${AGENT_API_KEY:?set AGENT_API_KEY in .env}
+      # Empty turns the dashboard password login off.
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      SEARXNG_URL: http://searxng:8080
+      SANDBOX_URL: http://sandbox:8070
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:?set SANDBOX_TOKEN in .env}
+      AGENT_DATA_DIR: /data
+      WORKSPACE_DIR: /workspace
+      TZ: ${TZ:-UTC}
+      AGENT_THINKING: ${AGENT_THINKING:-auto}
+      AGENT_MAX_STEPS: ${AGENT_MAX_STEPS:-12}
+      AGENT_CTX_TOKENS: ${AGENT_CTX_TOKENS:-14000}
+      AGENT_MAX_OUTPUT_TOKENS: ${AGENT_MAX_OUTPUT_TOKENS:-1500}
+      CPU_GOVERNOR: ${CPU_GOVERNOR:-on}
+      CPU_BASELINE: ${CPU_BASELINE:-0.60}
+      BACKGROUND_REST_RATIO: ${BACKGROUND_REST_RATIO:-0.5}
+      MIN_SCHEDULE_INTERVAL_MIN: ${MIN_SCHEDULE_INTERVAL_MIN:-15}
+      MAX_SCHEDULES: ${MAX_SCHEDULES:-50}
+      ENABLE_RUN_CODE: ${ENABLE_RUN_CODE:-true}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ALLOWED_IDS: ${TELEGRAM_ALLOWED_IDS:-}
+      TELEGRAM_API_BASE: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+      PAIRING_CODE: ${PAIRING_CODE:-}
+    volumes:
+      - ${DATA_DIR:-./data}/agent:/data
+      - ${DATA_DIR:-./data}/workspace:/workspace
+    cap_drop:
+      - ALL
+    # The agent finishes or marks its running task before it exits.
+    stop_grace_period: 20s
+    networks:
+      - edge
+      - llm_net
+      - search_net
+      - sandbox_net
+
+  # Where code written by the agent runs: no route to the internet or to the
+  # host, read-only root filesystem, no capabilities, hard resource limits.
+  sandbox:
+    <<: *common
+    build: ./sandbox
+    environment:
+      SANDBOX_TOKEN: ${SANDBOX_TOKEN:?set SANDBOX_TOKEN in .env}
+      TZ: ${TZ:-UTC}
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      # Scratch space. Docker's default for tmpfs is noexec; scripts written
+      # here must be runnable.
+      - /tmp:exec,size=256m
+    pids_limit: 128
+    mem_limit: 1g
+    # Same value as mem_limit: no swap on top of the memory limit.
+    memswap_limit: 1g
+    cpus: 1.0
+    volumes:
+      - ${DATA_DIR:-./data}/workspace:/workspace
+    networks:
+      - sandbox_net
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8070/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # The web chat. Most of these settings are stored in Open WebUI's database
+  # at the first start; later changes are made in its admin pages, not here.
+  # The image ships its own healthcheck.
+  webui:
+    <<: *common
+    image: ${WEBUI_IMAGE:-ghcr.io/open-webui/open-webui:v0.13.5}
+    depends_on:
+      - agent
+      - searxng
+    environment:
+      # Model access: only through the agent service.
+      ENABLE_OLLAMA_API: "false"
+      ENABLE_OPENAI_API: "true"
+      OPENAI_API_BASE_URL: http://agent:8090/v1
+      OPENAI_API_KEY: ${AGENT_API_KEY:?set AGENT_API_KEY in .env}
+      DEFAULT_MODELS: assistant
+      # Accounts: one admin, created without the sign-up page.
+      WEBUI_SECRET_KEY: ${WEBUI_SECRET_KEY:?set WEBUI_SECRET_KEY in .env}
+      WEBUI_ADMIN_EMAIL: ${WEBUI_ADMIN_EMAIL:?set WEBUI_ADMIN_EMAIL in .env}
+      WEBUI_ADMIN_PASSWORD: ${WEBUI_ADMIN_PASSWORD:?set WEBUI_ADMIN_PASSWORD in .env}
+      WEBUI_ADMIN_NAME: ${WEBUI_ADMIN_NAME:-Owner}
+      ENABLE_SIGNUP: "false"
+      DEFAULT_USER_ROLE: pending
+      ENABLE_API_KEYS: "false"
+      JWT_EXPIRES_IN: 30d
+      # Address and cookies (always behind caddy, always HTTPS).
+      WEBUI_URL: https://${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+      CORS_ALLOW_ORIGIN: https://${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+      WEBUI_SESSION_COOKIE_SECURE: "true"
+      WEBUI_AUTH_COOKIE_SECURE: "true"
+      # Only caddy can reach this container, so its forwarded headers are trusted.
+      FORWARDED_ALLOW_IPS: "*"
+      # No extra model calls in the background: each one costs minutes on a CPU.
+      ENABLE_TITLE_GENERATION: "false"
+      ENABLE_TAGS_GENERATION: "false"
+      ENABLE_FOLLOW_UP_GENERATION: "false"
+      ENABLE_AUTOCOMPLETE_GENERATION: "false"
+      ENABLE_RETRIEVAL_QUERY_GENERATION: "false"
+      ENABLE_SEARCH_QUERY_GENERATION: "false"
+      ENABLE_IMAGE_PROMPT_GENERATION: "false"
+      TASK_MODEL: assistant
+      TASK_MODEL_EXTERNAL: assistant
+      CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS: "8"
+      TOOL_OUTPUT_MAX_CHARS: "12000"
+      # Web search through the private SearXNG.
+      ENABLE_WEB_SEARCH: "true"
+      WEB_SEARCH_ENGINE: searxng
+      SEARXNG_QUERY_URL: http://searxng:8080/search
+      WEB_SEARCH_RESULT_COUNT: "5"
+      WEB_SEARCH_CONCURRENT_REQUESTS: "2"
+      WEB_FETCH_MAX_CONTENT_LENGTH: "8000"
+      # Document search with the small embedding model that is in the image.
+      RAG_EMBEDDING_MODEL: sentence-transformers/all-MiniLM-L6-v2
+      RAG_EMBEDDING_MODEL_AUTO_UPDATE: "false"
+      # Nothing that phones home or runs code inside this container.
+      ENABLE_COMMUNITY_SHARING: "false"
+      ENABLE_VERSION_UPDATE_CHECK: "false"
+      ENABLE_AUTOMATION_WEBHOOKS: "false"
+      ENABLE_CODE_EXECUTION: "false"
+      ENABLE_CODE_INTERPRETER: "false"
+      ENABLE_PIP_INSTALL_FRONTMATTER_REQUIREMENTS: "false"
+      # Keep SQLite's memory use small; the model needs the RAM.
+      DATABASE_POOL_SIZE: "8"
+      DATABASE_SQLITE_PRAGMA_CACHE_SIZE: "-2000"
+      DATABASE_SQLITE_PRAGMA_MMAP_SIZE: "0"
+    volumes:
+      - ${DATA_DIR:-./data}/webui:/app/backend/data
+    networks:
+      - edge
+      - search_net
+
+  # Private metasearch engine for the agent and for Open WebUI.
+  searxng:
+    <<: *common
+    image: ${SEARXNG_IMAGE:-docker.io/searxng/searxng:2026.11.23-a7163d091}
+    # The image starts as root; its own unprivileged user is enough.
+    user: searxng:searxng
+    cap_drop:
+      - ALL
+    environment:
+      SEARXNG_SECRET: ${SEARXNG_SECRET:?set SEARXNG_SECRET in .env}
+      # The image listens on "::" by default, which fails to start on a host
+      # without IPv6. The Docker networks here are IPv4.
+      GRANIAN_HOST: 0.0.0.0
+    volumes:
+      - ./config/searxng/settings.yml:/etc/searxng/settings.yml:ro
+      # Only a cache; safe to lose, so a named volume is fine here.
+      - searxng_cache:/var/cache/searxng
+    networks:
+      - search_net
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-T", "5", "-t", "1", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+  # HTTPS and the access gate (see Caddyfile). The only published ports.
+  caddy:
+    <<: *common
+    image: ${CADDY_IMAGE:-caddy:2.11.9-alpine}
+    depends_on:
+      - webui
+      - agent
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:?set SITE_ADDRESS in .env}
+      GATE_TOKEN: ${GATE_TOKEN:?set GATE_TOKEN in .env}
+      CADDY_TLS_LINE: ${CADDY_TLS_LINE:-}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      # Certificates and keys: keep these directories.
+      - ${DATA_DIR:-./data}/caddy/data:/data
+      - ${DATA_DIR:-./data}/caddy/config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      # Listening on ports 80 and 443.
+      - NET_BIND_SERVICE
+      # Writing certificates whoever owns the two directories above (after a
+      # restore or a chown of the data directory they may not belong to root).
+      - DAC_OVERRIDE
+    networks:
+      - edge
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "443"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+networks:
+  # caddy <-> webui/agent. Has internet access (certificates, Telegram, web pages).
+  edge: {}
+  # SearXNG's own network; it needs the internet to query search engines.
+  search_net: {}
+  # No internet: the model server only answers the agent.
+  llm_net:
+    internal: true
+  # No internet and, with the isolated gateway mode, no address on the host
+  # side either: code in the sandbox cannot reach services on the host.
+  sandbox_net:
+    internal: true
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+
+volumes:
+  searxng_cache: {}

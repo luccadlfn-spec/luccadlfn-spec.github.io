@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# Fake docker for the installer tests. Logs each call to $FAKE_LOG and
+# answers from files in $FAKE_DIR. It never touches the real Docker.
+D=${FAKE_DIR:?}
+printf 'docker %s\n' "$*" >>"${FAKE_LOG:-/dev/null}"
+
+# A state file may hold several lines: each call uses up the first one until
+# a single line is left (so "starting, starting, healthy" can be played).
+next_line() {
+  local file=$1 fallback=$2
+  if [ ! -s "$file" ]; then
+    printf '%s\n' "$fallback"
+    return
+  fi
+  head -n 1 "$file"
+  if [ "$(wc -l <"$file")" -gt 1 ]; then sed -i 1d "$file"; fi
+}
+
+case "${1:-}" in
+  version)
+    cat "$D/docker_version" 2>/dev/null || echo "29.0.0"
+    exit 0
+    ;;
+  info)
+    [ -e "$D/docker_down" ] && exit 1
+    exit 0
+    ;;
+  ps)
+    port=""
+    ours=0
+    for arg in "$@"; do
+      case "$arg" in
+        publish=*)
+          port=${arg#publish=}
+          port=${port%/*}
+          ;;
+        label=com.docker.compose.project=myai) ours=1 ;;
+      esac
+    done
+    if [ "$ours" = 1 ]; then cat "$D/ps_ours_$port" 2>/dev/null; else cat "$D/ps_any_$port" 2>/dev/null; fi
+    exit 0
+    ;;
+  inspect)
+    id=${!#}
+    svc=${id#id-}
+    case "$*" in
+      *NetworkSettings*) cat "$D/ip_$svc" 2>/dev/null || echo "172.30.0.2" ;;
+      *) next_line "$D/state_$svc" "running healthy 0" ;;
+    esac
+    exit 0
+    ;;
+  image)
+    cat "$D/repodigests" 2>/dev/null
+    exit 0
+    ;;
+  compose) shift ;;
+  *) exit 0 ;;
+esac
+
+# docker compose [options] VERB ...
+envfile=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project-directory | -f | -p) shift 2 ;;
+    --env-file)
+      envfile=$2
+      shift 2
+      ;;
+    *) break ;;
+  esac
+done
+verb=${1:-}
+[ $# -gt 0 ] && shift
+
+case "$verb" in
+  version) echo "Docker Compose version v5.0.0" ;;
+  ps)
+    svc=${!#}
+    [ -e "$D/missing_$svc" ] || echo "id-$svc"
+    ;;
+  exec)
+    # exec -T agent python -c SCRIPT ARGS...
+    script=${5:-}
+    case "$script" in
+      *chat/completions*)
+        threads=$(sed -n 's/^LLM_THREADS=//p' "$envfile" 2>/dev/null | head -n 1)
+        if [ -s "$D/chat_reply" ]; then
+          reply=$(cat "$D/chat_reply")
+        elif [ -s "$D/bench_$threads" ]; then
+          reply="ok $(cat "$D/bench_$threads") 55.00 96 12.0"
+        else
+          reply="ok 6.20 61.00 40 7.1"
+        fi
+        ;;
+      */tasks*)
+        reply=$(cat "$D/task_reply" 2>/dev/null || echo "ok 1 20.0")
+        if [ -s "$D/task_proof" ]; then : >"$(cat "$D/task_proof")"; fi
+        ;;
+      *) reply="error unknown script" ;;
+    esac
+    printf '%s\n' "$reply"
+    case "$reply" in ok*) exit 0 ;; *) exit 1 ;; esac
+    ;;
+  *)
+    rc=$(cat "$D/rc_$verb" 2>/dev/null || echo 0)
+    exit "$rc"
+    ;;
+esac

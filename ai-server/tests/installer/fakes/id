@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The real id, unless $FAKE_DIR/uid gives the user number for "id -u".
+if [ "${1:-}" = -u ] && [ -s "$FAKE_DIR/uid" ]; then
+  cat "$FAKE_DIR/uid"
+  exit 0
+fi
+exec "${REAL_ID:?}" "$@"

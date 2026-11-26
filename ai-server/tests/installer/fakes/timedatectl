@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Fake timedatectl: prints $FAKE_DIR/tz, or fails like a machine without systemd.
+[ -s "$FAKE_DIR/tz" ] || exit 1
+cat "$FAKE_DIR/tz"
