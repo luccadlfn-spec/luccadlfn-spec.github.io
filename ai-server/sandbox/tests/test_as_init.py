@@ -64,9 +64,12 @@ def test_snippets_cannot_stop_the_server_but_docker_can(make_init_sandbox):
 def test_orphans_are_reaped_while_the_snippet_runs(make_init_sandbox):
     # Every `( sleep 0.01 & )` leaves an orphan, which the server inherits as
     # PID 1. Unreaped, the zombies count against the process limit until fork
-    # fails, and the run hangs until its timeout.
-    box = make_init_sandbox(SANDBOX_MAX_PROCS=str(_tasks_of(SANDBOX_UID) + 60))
-    result = box.run("bash", "for i in $(seq 300); do ( sleep 0.01 & ); done; echo finished", timeout=60)
+    # fails, and the run hangs until its timeout. 600 orphans are four times
+    # the limit's headroom; the headroom itself must absorb the few dozen
+    # sleeps and zombies alive at once on a busy machine (with 60, bash
+    # sometimes had to retry a fork even though the reaping kept up).
+    box = make_init_sandbox(SANDBOX_MAX_PROCS=str(_tasks_of(SANDBOX_UID) + 150))
+    result = box.run("bash", "for i in $(seq 600); do ( sleep 0.01 & ); done; echo finished", timeout=60)
     assert result["timed_out"] is False, result
     assert (result["exit_code"], result["stdout"]) == (0, "finished\n"), result
     assert "fork" not in result["stderr"]

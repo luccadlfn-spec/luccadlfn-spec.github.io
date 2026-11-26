@@ -119,6 +119,16 @@ def test_searxng_config_dir_is_a_named_volume(compose):
     assert mounts["/etc/searxng"]["source"] == "searxng_config"
 
 
+def test_model_server_keeps_one_copy_of_the_model_in_ram(compose):
+    # With weight repacking on, llama.cpp copies most weights into a second
+    # buffer while mlock still holds the whole mapped file: 7.6 GB of RAM for
+    # a 4.2 GB mixture-of-experts file. The default 21 GB model would then not
+    # fit in 32 GB. Both "false" and "0" were checked to switch repacking off.
+    environment = compose["services"]["llm"]["environment"]
+    assert environment["LLAMA_ARG_REPACK"] in ("false", "0")
+    assert "mmap" in environment["LLAMA_ARG_LOAD_MODE"]
+
+
 def test_agent_gets_the_model_servers_thinking_budget(compose):
     # The agent leaves room for as many thinking tokens as the model server
     # allows. Without the same value, a budget raised in .env lets the model

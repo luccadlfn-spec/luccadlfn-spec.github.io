@@ -42,6 +42,12 @@ services:
       LLAMA_ARG_N_PARALLEL: ${LLM_PARALLEL:-2}
       LLAMA_ARG_THREADS: ${LLM_THREADS:-6}
       LLAMA_ARG_LOAD_MODE: ${LLM_LOAD_MODE:-mmap+mlock}
+      # Keep the model as one copy in RAM. With repacking on, llama.cpp copies
+      # most weights into a second, rearranged buffer while mlock still holds
+      # the mapped file: measured 7.6 GB for a 4.2 GB mixture-of-experts file,
+      # so the default 21 GB model would not fit in 32 GB. Repacking off read
+      # prompts 1.7x faster on that model and wrote just as fast.
+      LLAMA_ARG_REPACK: "false"
       LLAMA_ARG_CACHE_RAM: ${LLM_CACHE_RAM_MIB:-2048}
       LLAMA_ARG_CTX_CHECKPOINTS: "8"
       LLAMA_ARG_UI: "false"
